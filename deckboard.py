@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -636,7 +637,7 @@ def main() -> int:
                         justify="left", wraplength=430)
     warn_lbl.pack(fill="x", padx=8)
 
-    state = {"argv": None, "env": None, "armed": False}
+    state = {"argv": None, "env": None, "armed": False, "proc": None}
 
     def current():
         ids = [k for k, v in id_vars.items() if v.get()]
@@ -663,13 +664,70 @@ def main() -> int:
 
     logbox = frame(right)
     logbox.grid(row=1, column=0, sticky="nsew")
-    heading(logbox, "█ OUTPUT")
+    heading(logbox, "█ OUTPUT  (ctrl-c interrupts · type + enter sends to stdin)")
     log = tk.Text(logbox, bg=BG, fg=INK, font=MONO, bd=0, wrap="none",
                   insertbackground=ACCENT)
-    log.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+    log.pack(fill="both", expand=True, padx=8, pady=(0, 4))
     log.tag_configure("cmd", foreground=ACCENT)
     log.tag_configure("err", foreground=BAD)
     log.tag_configure("end", foreground=GOOD)
+
+    # Terminal manners. Ctrl-C with a selection still copies (this is a window, not an
+    # xterm); with NO selection it does what a terminal does — SIGINT to the solve's whole
+    # process group, which julia takes as InterruptException, so a wedged solve dies
+    # without taking the window with it.
+    def interrupt(_e=None):
+        p = state["proc"]
+        if p is not None and p.poll() is None:
+            lines.put(("^C\n", "err"))
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGINT)
+            except ProcessLookupError:
+                pass
+        return "break"
+
+    def log_ctrl_c(_e):
+        if log.tag_ranges("sel"):
+            return None                     # fall through to the default <<Copy>>
+        return interrupt()
+
+    log.bind("<Control-c>", log_ctrl_c)
+
+    # stdin. Anything the solve asks on its terminal (a readline prompt, an overwrite
+    # question) used to hang forever with no way to answer but killing the run.
+    inrow = tk.Frame(logbox, bg=PANEL)
+    inrow.pack(fill="x", padx=8, pady=(0, 8))
+    tk.Label(inrow, text="❯", bg=PANEL, fg=ACCENT, font=MONO_B).pack(side="left")
+    stdin_entry = tk.Entry(inrow, bg=BG, fg=INK, font=MONO, insertbackground=ACCENT,
+                           bd=0, highlightbackground=EDGE, highlightthickness=1)
+    stdin_entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+    def send_stdin(_e=None):
+        text = stdin_entry.get()
+        stdin_entry.delete(0, "end")
+        p = state["proc"]
+        if p is None or p.poll() is not None or p.stdin is None:
+            lines.put(("(nothing is running to receive input)\n", "err"))
+            return
+        lines.put((text + "\n", "cmd"))     # echo, the way a terminal would
+        try:
+            p.stdin.write(text + "\n")
+            p.stdin.flush()
+        except (BrokenPipeError, ValueError):
+            lines.put(("(stdin is closed)\n", "err"))
+
+    stdin_entry.bind("<Return>", send_stdin)
+    stdin_entry.bind("<Control-c>", interrupt)
+
+    def log_type(e):
+        """The log is history, not a buffer — printable keys land in the input line."""
+        if e.char and e.char.isprintable():
+            stdin_entry.focus_set()
+            stdin_entry.insert("end", e.char)
+            return "break"
+        return None
+
+    log.bind("<Key>", log_type)
 
     lines: queue.Queue = queue.Queue()
 
@@ -698,8 +756,12 @@ def main() -> int:
         def worker():
             e = dict(os.environ, **env)
             try:
-                p = subprocess.Popen(argv, cwd=REPO, env=e, stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT, text=True, bufsize=1)
+                # Its own session, so Ctrl-C above can SIGINT the group (julia and anything
+                # julia spawned) without touching deckboard's own process group.
+                p = subprocess.Popen(argv, cwd=REPO, env=e, stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                     text=True, bufsize=1, start_new_session=True)
+                state["proc"] = p
                 for line in p.stdout:
                     lines.put((line, None))
                 p.wait()
@@ -708,6 +770,7 @@ def main() -> int:
                 lines.put(("\njulia is not on PATH — start deckboard from a shell that has it.\n",
                            "err"))
             finally:
+                state["proc"] = None
                 root.after(0, lambda: run_btn.configure(state="normal"))
                 root.after(0, preview)
 

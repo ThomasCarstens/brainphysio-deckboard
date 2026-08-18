@@ -31,17 +31,29 @@ you want the numbers in a terminal or a notebook instead.
 RUNNING A SOLVE IS TWO CLICKS, NEVER ONE. Building the command and executing it are separate
 buttons, because a deck run ends by uploading its PNGs to Google Drive — a misclick is an
 outward-facing action, not just some wasted minutes.
+
+THE RUN GOES TO A NEW TERMINAL. The board does not own the process at all: it builds the
+command, opens a terminal window and hands it over. A terminal already does scrollback,
+ctrl-c and stdin better than a Text widget can, and — the actual point — you get as many as
+you want, so the second thing you run does not queue behind the first. Nothing is piped
+back here, so closing the board does not touch a solve that is still going.
+
+THE EXPORTS ARE THE OTHER HALF OF THE WINDOW. Every .h5 the repo holds is listed with its
+size and its vintage. Click one and the command becomes a REPLOT of that exact vintage
+(_SIM_STAMP) rather than a re-solve — the store already holds the answer far more often
+than not, and a solve is minutes where a replot is seconds. Deleting is here too, because a
+sweep vintage is fifty 155 MB files in one folder and nothing else in the repo offers to
+remove any of it.
 """
 
 from __future__ import annotations
 
 import os
 import re
-import signal
+import shlex
+import shutil
 import subprocess
 import sys
-import threading
-import queue
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -229,6 +241,30 @@ def _fmt(dt: datetime | None) -> str:
     return dt.strftime("%Y-%m-%d %H:%M") if dt else "—"
 
 
+def open_folder(path: str) -> None:
+    """Hand a deck's folder to the desktop's file manager.
+
+    Detached and never awaited — the opener outlives this process and its exit code says
+    nothing useful anyway. A failure (no desktop, headless session) is printed rather than
+    raised: not being able to open a window is not a reason to take the board down.
+    """
+    if not os.path.isdir(path):
+        print(f"deckboard: no such folder {path}", file=sys.stderr)
+        return
+    if sys.platform == "darwin":
+        cmd = ["open", path]
+    elif os.name == "nt":
+        os.startfile(path)  # noqa: S606 — the Windows opener has no argv form
+        return
+    else:
+        cmd = ["xdg-open", path]
+    try:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError as e:
+        print(f"deckboard: could not open {path} — {e}", file=sys.stderr)
+
+
 @dataclass
 class Sim:
     model: str
@@ -365,25 +401,239 @@ def decks(sims: list[Sim]) -> list[Deck]:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# THE EXPORTS
+# ══════════════════════════════════════════════════════════════════════════════
+# One row per .h5 FILE, not per vintage. A sweep vintage is fifty 155 MB files in a single
+# stamp folder, so "which points exist, and what do they cost" is a question the vintage
+# list above — one line for the whole folder — cannot answer. It is also where the disk
+# goes: the store runs to tens of gigabytes and nothing else here offers to delete any.
+
+def _size(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} TB"
+
+
+@dataclass(frozen=True)
+class Export:
+    path: str
+    model: str
+    experiment: str
+    variant: str
+    stamp: str
+    file: str
+    size: int
+    mtime: datetime
+    meta: dict
+
+    @property
+    def family(self) -> str:
+        return "/".join(p for p in (self.model, self.experiment, self.variant) if p)
+
+
+def exports() -> list[Export]:
+    """Every .h5 in the repo, newest vintage first.
+
+    TWO ROOTS, because there are two kinds. The STORE
+    (`simulations/<model>/<experiment>/<variant>/<stamp>/`) is where a solve files its
+    exports and where the gigabytes are; its meta.json describes the whole vintage, so
+    every file in one carries the same one. A stray .h5 under `output/` is a deck folder
+    holding its own copy from before the store existed — listed rather than hidden,
+    precisely because nothing else in the board accounts for it.
+    """
+    rows: list[Export] = []
+    for v in STORE.inventory():
+        meta = v.meta()
+        for name in v.files():
+            try:
+                st = os.stat(v.file(name))
+            except OSError:          # deleted from under us between listing and stat
+                continue
+            rows.append(Export(v.file(name), v.model, v.experiment, v.variant, v.stamp,
+                               name, st.st_size, datetime.fromtimestamp(st.st_mtime), meta))
+    for dirpath, _, files in os.walk(OUTPUT):
+        for name in sorted(f for f in files if f.endswith(".h5")):
+            p = os.path.join(dirpath, name)
+            try:
+                st = os.stat(p)
+            except OSError:
+                continue
+            deck = os.path.relpath(dirpath, OUTPUT).split(os.sep)[0]
+            rows.append(Export(p, "output", deck, "", "", name, st.st_size,
+                               datetime.fromtimestamp(st.st_mtime), {}))
+    return sorted(rows, key=lambda r: (r.stamp, r.family, r.file), reverse=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# THE REPLOT JOBS
+# ══════════════════════════════════════════════════════════════════════════════
+# Pinning a vintage is only half of "use this instead of solving": the other half is the
+# DRIVER, and every deck is drawn with a protocol (angle / pressure / static) that is not
+# derivable from its name. That mapping already exists — plot_all_decks.jl's JOBS table is
+# what a full replot run uses — so it is parsed, like the registry, rather than restated. A
+# deck this cannot find gets no replot offered, instead of one drawn as the wrong protocol.
+
+PLOT_ALL_JL = {n: os.path.join(REPO, f"Model_{n}", "plot_all_decks.jl")
+               for n in ("3", "4")}
+
+
+def _kwargs(s: str) -> dict[str, str]:
+    return dict(re.findall(r'(\w+)\s*=\s*"([^"]*)"', s))
+
+
+def parse_replot_jobs() -> dict[str, dict[str, dict]]:
+    """deck folder -> {model: {kind, protocol, deck, sweep, ramp_target, beats_models}}.
+
+    `kind` is which of the two builders the table used: a plain deck goes to
+    replot_deck.jl, a sweep to main_sweep.jl with _REPLOT=1. The `deck` INSIDE a sweep
+    entry is not the key — a sweep folder is drawn by the analysis deck it belongs to.
+
+    KEYED BY MODEL, because there are two tables and they overlap. `postural_changes_k_sweep`
+    is in both, each drawing it with its own analysis deck. And the model has to come from
+    the TABLE rather than from the MODEL buttons: `postural_changes_m1_vs_m3` is an M1-and-M3
+    deck that only Model_3 knows how to redraw, so choosing the driver by which model
+    produced the .h5 would send it to a Model_1 replot driver that does not exist.
+    """
+    jobs: dict[str, dict[str, dict]] = {}
+    for model, path in PLOT_ALL_JL.items():
+        if not os.path.isfile(path):
+            continue
+        text = _uncommented(path)
+        for kind, fn in (("deck", "replot_cmd"), ("sweep", "sweep_replot_cmd")):
+            for m in re.finditer(r'"(\w+)"\s*=>\s*\[' + fn + r'\(;([^)]*)\)\]', text):
+                jobs.setdefault(m.group(1), {})[model] = dict(
+                    _kwargs(m.group(2)), kind=kind, model=model)
+    if not jobs:
+        raise SystemExit(f"deckboard: parsed no replot jobs from "
+                         f"{', '.join(PLOT_ALL_JL.values())} — the JOBS table moved, fix "
+                         f"parse_replot_jobs().")
+    return jobs
+
+
+REPLOT_JOBS = parse_replot_jobs()
+
+
+def job_for(deck: str, model: str) -> dict | None:
+    """This deck's replot job: the selected model's if that model draws it, otherwise the
+    only model that claims it. Two claimants and neither selected is genuinely ambiguous —
+    a sweep folder drawn by M3 and by M4 — so it returns None rather than picking."""
+    jobs = REPLOT_JOBS.get(deck, {})
+    if model in jobs:
+        return jobs[model]
+    return next(iter(jobs.values())) if len(jobs) == 1 else None
+
+
+def replot_driver(job: dict) -> str | None:
+    """The script that redraws without solving, if the job's model has one. M1 has no
+    replot_deck.jl, and saying so is better than pinning a vintage onto an entry point that
+    will cheerfully solve it again."""
+    rel = f"Model_{job['model']}/" + ("main_sweep.jl" if job["kind"] == "sweep"
+                                      else "replot_deck.jl")
+    return rel if os.path.isfile(os.path.join(REPO, rel)) else None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HANDING IT TO A TERMINAL
+# ══════════════════════════════════════════════════════════════════════════════
+# In the order they are tried, each with the flag that means "the rest is the command".
+# $TERMINAL wins if you set it, and is assumed to take -e — every one of these but
+# gnome-terminal does.
+
+TERMINALS = [("gnome-terminal", ["--"]), ("konsole", ["-e"]), ("xfce4-terminal", ["-x"]),
+             ("mate-terminal", ["--"]), ("tilix", ["-e"]), ("terminator", ["-x"]),
+             ("alacritty", ["-e"]), ("kitty", []), ("foot", []),
+             ("wezterm", ["start", "--"]), ("x-terminal-emulator", ["-e"]),
+             ("xterm", ["-e"])]
+
+
+def terminal_script(argv: list[str], env: dict[str, str], title: str) -> str:
+    """The shell the terminal is asked to run.
+
+    The environment is written INTO the script rather than passed as the terminal's own:
+    gnome-terminal and friends spawn the window from a long-lived server process, which
+    does not reliably carry the calling process's environ. Written in, it is also exactly
+    the line the COPY button hands you, so what runs is what you can paste.
+
+    It ends on a `read`, so a run that dies in the first second leaves its traceback on the
+    screen instead of closing the window it was printed in.
+    """
+    line = ("env " + " ".join(f"{k}={shlex.quote(v)}" for k, v in env.items()) + " "
+            + " ".join(shlex.quote(a) for a in argv))
+    return (f"cd {shlex.quote(REPO)} || exit 1\n"
+            f"printf '\\033]0;%s\\007' {shlex.quote(title)}\n"
+            f"{line}\n"
+            f"rc=$?\n"
+            f"printf '\\n[exit %s]\\n' \"$rc\"\n"
+            f"read -r -p 'press enter to close '\n")
+
+
+def launch_in_terminal(argv: list[str], env: dict[str, str], title: str) -> str:
+    """Open a terminal running the command; return which one. Raises if there is none."""
+    script = terminal_script(argv, env, title)
+    first = [(os.environ["TERMINAL"], ["-e"])] if os.environ.get("TERMINAL") else []
+    for name, flag in first + TERMINALS:
+        exe = shutil.which(name)
+        if exe is None:
+            continue
+        # stderr is deliberately NOT swallowed: a terminal that refuses its own arguments
+        # then says so on the shell deckboard was started from, which is a great deal
+        # easier to work out than a window that simply never appears.
+        subprocess.Popen([exe, *flag, "bash", "-lc", script], cwd=REPO,
+                         start_new_session=True)
+        return name
+    raise RuntimeError("no terminal emulator found — set $TERMINAL to the one you use")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # THE COMMAND
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_command(model: str, deck: str, run_ids: list[str], extra: str,
-                  plot: bool) -> tuple[list[str], dict[str, str], str]:
-    """(argv, env-overlay, the copy-pasteable line). One place, so what the window SHOWS
-    and what it RUNS cannot drift — the shown text is rendered from the same dict."""
+                  plot: bool, pin: str = "") -> tuple[list[str], dict[str, str], str]:
+    """(argv, env-overlay, the copy-pasteable line). One place, so what the window SHOWS,
+    what it RUNS and what COPY gives you cannot drift — all three render from this dict.
+
+    WITH A PIN it is a DIFFERENT command, not the same one with a variable bolted on. A
+    pinned vintage means "draw what is already on disk", and that is replot_deck.jl — or
+    main_sweep.jl with _REPLOT=1 for a sweep — plus the deck's protocol out of the JOBS
+    table. main.jl would accept _SIM_STAMP and then solve anyway, which is the one outcome
+    a pin is chosen to avoid. When the model has no replot driver, or the deck is not in
+    the table, it falls back to main.jl carrying the pin and the window says plainly that
+    this will still solve.
+    """
+    job = job_for(deck, model) if pin else None
+    driver = replot_driver(job) if job else None
+    if pin and job and driver:
+        env = {"_SIM_STAMP": pin, "_PROTOCOL": job.get("protocol", "angle"),
+               # A sweep folder is drawn by the analysis deck it belongs to, so the _DECK
+               # here is the table's, not the folder you clicked.
+               "_DECK": job.get("deck", deck)}
+        if job["kind"] == "sweep":
+            env.update(_SWEEP=job.get("sweep", ""), _REPLOT="1", _SIM_MODE="1",
+                       _RAMP_TARGET=job.get("ramp_target", "Theta"))
+        elif job.get("beats_models"):
+            env["_BEATS_MODELS"] = job["beats_models"]
+        argv = ["julia", "--project=.", driver]
+        return _finish(env, argv, extra)
     env = {"_MODEL": model, "_DECK": deck}
+    if pin:
+        env["_SIM_STAMP"] = pin
     if run_ids:
         env["_RUN_IDS"] = ",".join(run_ids)
     if not plot:
         env["_NOPLOT"] = "1"
     # Free-form `K=V K=V`, applied last so it can override anything above — including
     # _MODEL, which is occasionally what you want.
+    return _finish(env, ["julia", "--project=.", "main.jl"], extra)
+
+
+def _finish(env: dict[str, str], argv: list[str], extra: str):
     for tok in extra.split():
         if "=" in tok:
             k, v = tok.split("=", 1)
             env[k if k.startswith("_") else "_" + k] = v
-    argv = ["julia", "--project=.", "main.jl"]
     shown = " ".join(f"{k}={v}" for k, v in env.items()) + " " + " ".join(argv)
     return argv, env, shown
 
@@ -439,6 +689,72 @@ MONO    = ("DejaVu Sans Mono", 10)
 MONO_B  = ("DejaVu Sans Mono", 10, "bold")
 TITLE_F = ("DejaVu Sans Mono", 15, "bold")
 
+BRAIN_SVG = os.path.join(REPO, "brain.svg")
+
+
+def _quad_points(d: str) -> list[tuple[float, float]]:
+    """An SVG path as a polyline. ABSOLUTE M / Q / Z only — which is all brain.svg uses —
+    with each quadratic sampled into eight segments. Anything else returns nothing at all,
+    so an unfamiliar path is skipped rather than drawn wrong."""
+    toks = re.findall(r"[A-Za-z]|-?[\d.]+", d)
+    out: list[tuple[float, float]] = []
+    cur = (0.0, 0.0)
+    i = 0
+    while i < len(toks):
+        c, i = toks[i], i + 1
+        if c == "M" and i + 1 < len(toks):
+            cur = (float(toks[i]), float(toks[i + 1]))
+            i += 2
+            out.append(cur)
+        elif c == "Q" and i + 3 < len(toks):
+            cx, cy, x, y = (float(toks[i + k]) for k in range(4))
+            i += 4
+            for k in range(1, 9):
+                t, mt = k / 8, 1 - k / 8
+                out.append((mt * mt * cur[0] + 2 * mt * t * cx + t * t * x,
+                            mt * mt * cur[1] + 2 * mt * t * cy + t * t * y))
+            cur = (x, y)
+        elif c in "Zz":
+            continue
+        else:
+            return []
+    return out
+
+
+def draw_brain(canvas, size: int) -> None:
+    """brain.svg itself, in the corner of the banner.
+
+    The palette above was sampled from this file — the ground is its glasses, the rules are
+    its sulci, the hot pink is its gear — so the mark it was taken from belongs here, small
+    and in those same colours rather than its own pinks.
+
+    DRAWS NOTHING ON ANY SURPRISE. It is decoration: a missing file, an unfamiliar path
+    command or a viewBox that moved must cost an empty corner, never the window."""
+    try:
+        svg = open(BRAIN_SVG, encoding="utf-8").read()
+        s = size / 64.0                      # brain.svg is viewBox="0 0 64 64"
+        for tag in re.findall(r"<path[^>]*>", svg):
+            d = re.search(r'\bd="([^"]+)"', tag)
+            pts = _quad_points(d.group(1)) if d else []
+            if len(pts) < 2:
+                continue
+            flat = [c * s for p in pts for c in p]
+            if 'fill="none"' in tag:         # a sulcus
+                canvas.create_line(*flat, fill=DEEP, width=1)
+            else:                            # the cortex itself
+                canvas.create_polygon(*flat, fill=EDGE, outline="")
+        for cx, cy, r in re.findall(
+                r'<circle[^>]*cx="([\d.]+)"[^>]*cy="([\d.]+)"[^>]*r="([\d.]+)"', svg):
+            x, y, rr = float(cx) * s, float(cy) * s, float(r) * s
+            canvas.create_oval(x - rr, y - rr, x + rr, y + rr, outline=DEEP)
+        for x1, y1, x2, y2 in re.findall(
+                r'<line[^>]*x1="([\d.]+)"[^>]*y1="([\d.]+)"[^>]*x2="([\d.]+)"[^>]*y2="([\d.]+)"',
+                svg):
+            canvas.create_line(float(x1) * s, float(y1) * s, float(x2) * s, float(y2) * s,
+                               fill=DEEP)
+    except Exception:                        # decoration: never fatal, never loud
+        pass
+
 
 def main() -> int:
     if "--report" in sys.argv:
@@ -470,6 +786,9 @@ def main() -> int:
     # --- banner -------------------------------------------------------------
     top = tk.Frame(root, bg=BG)
     top.pack(fill="x", padx=10, pady=(10, 4))
+    glyph = tk.Canvas(top, width=26, height=26, bg=BG, highlightthickness=0, bd=0)
+    glyph.pack(side="left", padx=(0, 8))
+    draw_brain(glyph, 26)
     tk.Label(top, text="▛▀▘ DECKBOARD", bg=BG, fg=ACCENT, font=TITLE_F).pack(side="left")
     nstale = sum(1 for d in ds if d.kind != "unmapped" and d.stale)
     tk.Label(top,
@@ -509,7 +828,7 @@ def main() -> int:
 
     plotbox = frame(left)
     plotbox.grid(row=1, column=0, sticky="nsew")
-    heading(plotbox, "█ PLOTS  (which runs they came from · staleness)")
+    heading(plotbox, "█ PLOTS  (click a name to load it · ↗ opens its folder)")
     plottxt = tk.Text(plotbox, bg=BG, fg=INK, font=MONO, bd=0, height=12, wrap="none")
     plottxt.pack(fill="both", expand=True, padx=8, pady=(0, 8))
     for tag, col in (("ok", GOOD), ("stale", BAD), ("miss", WARN), ("dim", DIM)):
@@ -539,8 +858,17 @@ def main() -> int:
             plottxt.tag_bind(tag, "<Button-1>", lambda _e, d=d: load_deck(d))
             plottxt.tag_bind(tag, "<Enter>", lambda _e: plottxt.configure(cursor="hand2"))
             plottxt.tag_bind(tag, "<Leave>", lambda _e: plottxt.configure(cursor=""))
+        # Every deck gets the opener, unmapped ones included — "what is actually in this
+        # folder" is exactly the question an unmapped folder raises, and it is the one
+        # thing this window cannot answer for it.
+        otag = f"open{i}"
+        plottxt.tag_configure(otag, foreground=ACCENT)
+        plottxt.tag_bind(otag, "<Button-1>", lambda _e, p=d.dir: open_folder(p))
+        plottxt.tag_bind(otag, "<Enter>", lambda _e: plottxt.configure(cursor="hand2"))
+        plottxt.tag_bind(otag, "<Leave>", lambda _e: plottxt.configure(cursor=""))
         plottxt.insert("end", f" [{d.badge}] ", state)
-        plottxt.insert("end", f"{d.name}\n", tag)
+        plottxt.insert("end", f"{d.name}", tag)
+        plottxt.insert("end", "  ↗\n", otag)
         plottxt.insert("end", f"     {len(d.pngs)} png · drawn {_fmt(d.drawn)}"
                               f" … {_fmt(d.newest_png)}\n", "dim")
         for s in d.sources:
@@ -637,12 +965,16 @@ def main() -> int:
                         justify="left", wraplength=430)
     warn_lbl.pack(fill="x", padx=8)
 
-    state = {"argv": None, "env": None, "armed": False, "proc": None}
+    # The launcher's state. No process lives here: a run is handed to a terminal and
+    # forgotten about. "pin" is the vintage clicked in EXPORTS below, and it changes WHICH
+    # command gets built rather than just adding a variable to the one that was there.
+    state = {"argv": None, "env": None, "armed": False,
+             "pin": "", "sel": None, "seltag": "", "del_armed": False}
 
     def current():
         ids = [k for k, v in id_vars.items() if v.get()]
         return build_command(model_var.get(), deck_entry.get().strip(), ids,
-                             extra_entry.get(), plot_var.get())
+                             extra_entry.get(), plot_var.get(), state["pin"])
 
     def preview(*_):
         argv, env, shown = current()
@@ -654,127 +986,176 @@ def main() -> int:
         want = models_of(deck)
         chosen = [k for k, v in id_vars.items() if v.get()]
         # The deck draws a fixed id set; anything you solve outside it is stored but not
-        # drawn, and anything in it you did NOT solve is drawn from an older vintage.
-        if chosen and not set(chosen) & set(want):
+        # drawn, and anything in it you did NOT solve is drawn from an older vintage. A
+        # replot has no say in what it solves, so the note is about solving only.
+        if chosen and not state["pin"] and not set(chosen) & set(want):
             notes.append(f"none of {', '.join(chosen)} is drawn by {deck} "
                          f"(it overlays {', '.join(want)})")
-        if plot_var.get():
+        # A pin that cannot reach a replot driver is the one case where the button does the
+        # OPPOSITE of what clicking an export means, so it is said plainly rather than left
+        # to be discovered when the terminal starts solving.
+        if state["pin"]:
+            job = job_for(deck, model_var.get())
+            if job is None:
+                notes.append(f"no replot job for {deck} in plot_all_decks.jl (pick the "
+                             f"model if two claim it) — pinned, but this will still SOLVE")
+            elif replot_driver(job) is None:
+                notes.append(f"M{job['model']} has no replot driver — the vintage is "
+                             f"pinned, but this will still SOLVE")
+        if plot_var.get() or state["pin"]:
             notes.append("this ends by uploading the deck's PNGs to Google Drive.")
         warn_lbl.configure(text="  ".join("⚠ " + n for n in notes))
 
-    logbox = frame(right)
-    logbox.grid(row=1, column=0, sticky="nsew")
-    heading(logbox, "█ OUTPUT  (ctrl-c interrupts · type + enter sends to stdin)")
-    log = tk.Text(logbox, bg=BG, fg=INK, font=MONO, bd=0, wrap="none",
-                  insertbackground=ACCENT)
-    log.pack(fill="both", expand=True, padx=8, pady=(0, 4))
-    log.tag_configure("cmd", foreground=ACCENT)
-    log.tag_configure("err", foreground=BAD)
-    log.tag_configure("end", foreground=GOOD)
+    # --- the pin, and where the last run went -------------------------------
+    pinrow = tk.Frame(runbox, bg=PANEL)
+    pinrow.pack(fill="x", padx=8, pady=(4, 0))
+    tk.Label(pinrow, text="PIN", bg=PANEL, fg=DIM, font=MONO, width=8,
+             anchor="w").pack(side="left")
+    NOPIN = "none — newest vintage of each run"
+    pin_lbl = tk.Label(pinrow, text=NOPIN, bg=PANEL, fg=DIM, font=MONO, anchor="w")
+    pin_lbl.pack(side="left")
 
-    # Terminal manners. Ctrl-C with a selection still copies (this is a window, not an
-    # xterm); with NO selection it does what a terminal does — SIGINT to the solve's whole
-    # process group, which julia takes as InterruptException, so a wedged solve dies
-    # without taking the window with it.
-    def interrupt(_e=None):
-        p = state["proc"]
-        if p is not None and p.poll() is None:
-            lines.put(("^C\n", "err"))
-            try:
-                os.killpg(os.getpgid(p.pid), signal.SIGINT)
-            except ProcessLookupError:
-                pass
-        return "break"
+    def clear_pin(*_):
+        if state["seltag"]:
+            xtxt.tag_configure(state["seltag"], foreground=INK)
+        state.update(pin="", sel=None, seltag="", del_armed=False)
+        pin_lbl.configure(text=NOPIN, fg=DIM)
+        del_btn.configure(text="✕ DELETE", bg=PANEL, fg=BAD)
+        sel_lbl.configure(text=SUMMARY, fg=DIM)
+        preview()
 
-    def log_ctrl_c(_e):
-        if log.tag_ranges("sel"):
-            return None                     # fall through to the default <<Copy>>
-        return interrupt()
+    tk.Button(pinrow, text="CLEAR", command=clear_pin, bg=PANEL, fg=ACCENT2,
+              activebackground=EDGE, activeforeground=BG, font=MONO, bd=0, relief="flat",
+              padx=6).pack(side="right")
 
-    log.bind("<Control-c>", log_ctrl_c)
-
-    # stdin. Anything the solve asks on its terminal (a readline prompt, an overwrite
-    # question) used to hang forever with no way to answer but killing the run.
-    inrow = tk.Frame(logbox, bg=PANEL)
-    inrow.pack(fill="x", padx=8, pady=(0, 8))
-    tk.Label(inrow, text="❯", bg=PANEL, fg=ACCENT, font=MONO_B).pack(side="left")
-    stdin_entry = tk.Entry(inrow, bg=BG, fg=INK, font=MONO, insertbackground=ACCENT,
-                           bd=0, highlightbackground=EDGE, highlightthickness=1)
-    stdin_entry.pack(side="left", fill="x", expand=True, padx=(6, 0))
-
-    def send_stdin(_e=None):
-        text = stdin_entry.get()
-        stdin_entry.delete(0, "end")
-        p = state["proc"]
-        if p is None or p.poll() is not None or p.stdin is None:
-            lines.put(("(nothing is running to receive input)\n", "err"))
-            return
-        lines.put((text + "\n", "cmd"))     # echo, the way a terminal would
-        try:
-            p.stdin.write(text + "\n")
-            p.stdin.flush()
-        except (BrokenPipeError, ValueError):
-            lines.put(("(stdin is closed)\n", "err"))
-
-    stdin_entry.bind("<Return>", send_stdin)
-    stdin_entry.bind("<Control-c>", interrupt)
-
-    def log_type(e):
-        """The log is history, not a buffer — printable keys land in the input line."""
-        if e.char and e.char.isprintable():
-            stdin_entry.focus_set()
-            stdin_entry.insert("end", e.char)
-            return "break"
-        return None
-
-    log.bind("<Key>", log_type)
-
-    lines: queue.Queue = queue.Queue()
-
-    def pump():
-        try:
-            while True:
-                text, tag = lines.get_nowait()
-                log.insert("end", text, tag)
-                log.see("end")
-        except queue.Empty:
-            pass
-        root.after(120, pump)
+    # The only thing the board still says about a run: which window it went to. Everything
+    # else about it is in that window.
+    launch_lbl = tk.Label(runbox, text="", bg=PANEL, fg=GOOD, font=MONO, anchor="w",
+                          justify="left", wraplength=430)
+    launch_lbl.pack(fill="x", padx=8, pady=(4, 0))
 
     def spawn():
-        """Two clicks: the first ARMS (shows exactly what will run), the second FIRES.
-        A solve is minutes long and ends outward-facing, so a single stray click must not
-        be able to start one."""
+        """Two clicks, unchanged. What the second one costs is now a window rather than a
+        wait — but a deck run still ends by uploading its PNGs, so a single stray click
+        must not be able to start one."""
         if not state["armed"]:
             state["armed"] = True
-            run_btn.configure(text="▶▶ CONFIRM — RUN IT", bg=ACCENT)
-            lines.put(("\n$ " + current()[2] + "\n", "cmd"))
+            run_btn.configure(text="▶▶ CONFIRM — OPEN A TERMINAL", bg=ACCENT)
             return
         argv, env, shown = current()
-        run_btn.configure(state="disabled", text="… RUNNING", bg=EDGE)
+        state["armed"] = False
+        run_btn.configure(text="▶ ARM", bg=EDGE)
+        deck = env.get("_DECK", "run")
+        try:
+            term = launch_in_terminal(argv, env, "deckboard: " + deck)
+        except RuntimeError as e:
+            launch_lbl.configure(text=f"✕ {e}", fg=BAD)
+            return
+        launch_lbl.configure(text=f"→ {datetime.now():%H:%M:%S}  {deck} — "
+                                  f"a new {term} window has it", fg=GOOD)
 
-        def worker():
-            e = dict(os.environ, **env)
-            try:
-                # Its own session, so Ctrl-C above can SIGINT the group (julia and anything
-                # julia spawned) without touching deckboard's own process group.
-                p = subprocess.Popen(argv, cwd=REPO, env=e, stdin=subprocess.PIPE,
-                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                     text=True, bufsize=1, start_new_session=True)
-                state["proc"] = p
-                for line in p.stdout:
-                    lines.put((line, None))
-                p.wait()
-                lines.put((f"\n[exit {p.returncode}]\n", "end" if p.returncode == 0 else "err"))
-            except FileNotFoundError:
-                lines.put(("\njulia is not on PATH — start deckboard from a shell that has it.\n",
-                           "err"))
-            finally:
-                state["proc"] = None
-                root.after(0, lambda: run_btn.configure(state="normal"))
-                root.after(0, preview)
+    # ── EXPORTS ──────────────────────────────────────────────────────────────
+    # Where the live output used to be. The output is in a terminal now, and the question
+    # this pane answers instead is the one that comes BEFORE a run: is the answer already
+    # on disk? Clicking a file pins its vintage, and the command above turns into a replot
+    # of it — seconds, against the minutes a re-solve costs.
+    xbox = frame(right)
+    xbox.grid(row=1, column=0, sticky="nsew")
+    heading(xbox, "█ EXPORTS  (click an .h5 to replot that vintage instead of solving)")
+    xtxt = tk.Text(xbox, bg=BG, fg=INK, font=MONO, bd=0, wrap="none")
+    xtxt.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+    for tag, col in (("hdr", DEEP), ("dim", DIM)):
+        xtxt.tag_configure(tag, foreground=col)
 
-        threading.Thread(target=worker, daemon=True).start()
+    XS = exports()
+    SUMMARY = f"{len(XS)} files · {_size(sum(x.size for x in XS))} on disk"
+
+    def select(x, tag):
+        """Pin this vintage AND move the launcher onto it: the model comes from the family
+        the file is filed under and the deck from the vintage's own meta.json, so what
+        appears is a command that would really redraw THIS file — not one you then have
+        to fix up by hand."""
+        if state["seltag"]:
+            xtxt.tag_configure(state["seltag"], foreground=INK)
+        xtxt.tag_configure(tag, foreground=ACCENT2)
+        state.update(sel=x, seltag=tag, del_armed=False, pin=x.stamp)
+        del_btn.configure(text="✕ DELETE", bg=PANEL, fg=BAD)
+        if x.model[1:] in ("1", "3", "4") and x.model.startswith("m"):
+            model_var.set(x.model[1:])
+            rebuild_ids()
+        if x.meta.get("deck"):
+            deck_entry.delete(0, "end")
+            deck_entry.insert(0, x.meta["deck"])
+        # An output/ .h5 predates the store and has no vintage to pin. It is listed so it
+        # can be SEEN and deleted, and the label says why it will not pin.
+        pin_lbl.configure(text=(f"{x.stamp} · {x.file}" if x.stamp else
+                                f"{x.file} — no vintage to pin"),
+                          fg=ACCENT2 if x.stamp else WARN)
+        sel_lbl.configure(text=f"{os.path.relpath(x.path, REPO)}  {_size(x.size)}  "
+                               f"{_fmt(x.mtime)}", fg=DIM)
+        preview()
+
+    last = None
+    for i, x in enumerate(XS):
+        if (x.stamp, x.family) != last:
+            last = (x.stamp, x.family)
+            m = x.meta
+            bits = "  ".join(b for b in (f"t_end {m['t_end']}" if "t_end" in m else "",
+                                         m.get("retcode", ""),
+                                         f"deck {m['deck']}" if "deck" in m else "") if b)
+            xtxt.insert("end", f"\n {x.stamp or '(no vintage)':<16}{x.family}\n", "hdr")
+            if bits:
+                xtxt.insert("end", f"      {bits}\n", "dim")
+        tag = f"x{i}"
+        xtxt.tag_configure(tag, foreground=INK)
+        xtxt.tag_bind(tag, "<Button-1>", lambda _e, x=x, t=tag: select(x, t))
+        xtxt.tag_bind(tag, "<Enter>", lambda _e: xtxt.configure(cursor="hand2"))
+        xtxt.tag_bind(tag, "<Leave>", lambda _e: xtxt.configure(cursor=""))
+        xtxt.insert("end", f"   {x.file}", tag)
+        xtxt.insert("end", f"   {_size(x.size)}  {_fmt(x.mtime)}\n", "dim")
+    xtxt.configure(state="disabled")
+
+    foot = tk.Frame(xbox, bg=PANEL)
+    foot.pack(fill="x", padx=8, pady=(0, 8))
+    sel_lbl = tk.Label(foot, text=SUMMARY, bg=PANEL, fg=DIM, font=MONO, anchor="w",
+                       justify="left", wraplength=360)
+    sel_lbl.pack(side="left", fill="x", expand=True)
+
+    def delete():
+        """Two clicks, like ARM, and for a harder reason: 155 MB of solve does not come
+        back. The confirming click is a DIFFERENT button — red, and naming the file and
+        its size — so it cannot be the same reflex that armed it."""
+        x = state["sel"]
+        if x is None:
+            sel_lbl.configure(text="click a file in the list first", fg=WARN)
+            return
+        if not state["del_armed"]:
+            state["del_armed"] = True
+            del_btn.configure(text=f"✕✕ CONFIRM DELETE {x.file} ({_size(x.size)})",
+                              bg=BAD, fg=BG)
+            return
+        state["del_armed"] = False
+        del_btn.configure(text="✕ DELETE", bg=PANEL, fg=BAD)
+        try:
+            os.remove(x.path)
+        except OSError as e:
+            sel_lbl.configure(text=f"could not delete: {e}", fg=BAD)
+            return
+        tag = state["seltag"]
+        if state["pin"] == x.stamp:
+            clear_pin()          # the pinned vintage may no longer hold what it promised
+        state.update(sel=None, seltag="")
+        # Struck through rather than removed: what WAS there is worth still being able to
+        # read. RESCAN rebuilds both lists for real.
+        xtxt.tag_configure(tag, foreground=EDGE, overstrike=True)
+        sel_lbl.configure(text=f"deleted {x.file} — {_size(x.size)} freed · "
+                               f"RESCAN to rebuild the lists", fg=GOOD)
+
+    del_btn = tk.Button(foot, text="✕ DELETE", command=delete, bg=PANEL, fg=BAD,
+                        activebackground=BAD, activeforeground=BG, font=MONO_B, bd=0,
+                        relief="flat", padx=12, pady=4, highlightbackground=EDGE,
+                        highlightthickness=1)
+    del_btn.pack(side="right")
 
     btns = tk.Frame(runbox, bg=PANEL)
     btns.pack(fill="x", padx=8, pady=8)
@@ -786,7 +1167,7 @@ def main() -> int:
     def copy():
         root.clipboard_clear()
         root.clipboard_append(current()[2])
-        lines.put(("\n(command copied to clipboard)\n", "end"))
+        launch_lbl.configure(text="(command copied to clipboard)", fg=ACCENT2)
 
     tk.Button(btns, text="COPY", command=copy, bg=PANEL, fg=ACCENT2,
               activebackground=EDGE, activeforeground=BG, font=MONO_B, bd=0,
@@ -794,6 +1175,8 @@ def main() -> int:
               highlightthickness=1).pack(side="left", padx=6)
 
     def refresh():
+        # Free to do at any time now: no run belongs to this process, so restarting it
+        # costs nothing but the window. This is also how a delete leaves the lists.
         root.destroy()
         os.execv(sys.executable, [sys.executable] + sys.argv)
 
@@ -820,9 +1203,27 @@ def main() -> int:
                 print(f"  clicked {d.name}:")
                 print(f"    {current()[2]}")
                 break
+        # The exports half, and the pinned command it builds. Nothing is launched: the
+        # selftest must never open a terminal, let alone start a solve.
+        print(f"  {len(XS)} exports · {_size(sum(x.size for x in XS))}")
+        pinnable = next((x for x in XS if x.stamp and x.meta.get("deck") in REPLOT_JOBS),
+                        None)
+        if pinnable is not None:
+            select(pinnable, "x%d" % XS.index(pinnable))
+            argv, env, shown = current()
+            print(f"  clicked {pinnable.stamp}/{pinnable.file}:")
+            print(f"    {shown}")
+            assert env.get("_SIM_STAMP") == pinnable.stamp, "the pin did not reach the env"
+            assert "replot" in argv[-1] or "sweep" in argv[-1], \
+                "a pinned command must not be the solving entry point"
+            script = terminal_script(argv, env, "deckboard: t")
+            assert "_SIM_STAMP" in script and "read -r -p" in script, "bad terminal script"
+            clear_pin()
+            assert current()[0][-1] == "main.jl", "clearing the pin did not restore main.jl"
+        print(f"  terminals available: "
+              f"{[n for n, _ in TERMINALS if shutil.which(n)] or 'NONE — set $TERMINAL'}")
         root.destroy()
         return 0
-    pump()
     root.mainloop()
     return 0
 

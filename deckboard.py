@@ -770,7 +770,10 @@ def main() -> int:
     sims = simulations()
     ds = decks(sims)
 
-    root = tk.Tk()
+    # className is what lands in WM_CLASS, and WM_CLASS is how the dock decides whether the
+    # window belongs to the pinned launcher or deserves an icon of its own. Left at the
+    # default every tkinter program on the machine is "Tk" and the brain icon does not match.
+    root = tk.Tk(className="Deckboard")
     root.title("DECKBOARD")
     root.configure(bg=BG)
     root.geometry("1280x860")

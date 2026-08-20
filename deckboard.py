@@ -28,6 +28,17 @@ root. It is a .py rather than a notebook because it has to own a window and a su
 the length of a solve, which a notebook cell does not do well; `--report` is there for when
 you want the numbers in a terminal or a notebook instead.
 
+WHAT IS SOLVED, NOT JUST WHICH DECK. A deck folder is `<experiment>_<suffix>` and the
+experiment is DERIVED in main.jl from (`_PROTOCOL`, `_RAMP_TARGET`) — so those two are not
+decoration on the command, they are what decides the folder the H5 is written to. The board
+used to send neither, which is not "unset" but `angle`/`Theta`: every deck it launched
+solved a postural tilt, and a `jugular_compression_*` deck then drew itself from whichever
+pressure exports happened to already be on disk. Both are selectors now, filled in FROM the
+deck through EXPERIMENT_FOR (parsed, like everything else here) and warned about when they
+disagree with it. `_RAMP_AMP` sits beside them: one number for how far the ramp goes —
+degrees under :angle, mmHg under :pressure — because amplitude was the one thing about a
+protocol you had to edit Protocol.jl to change.
+
 RUNNING A SOLVE IS TWO CLICKS, NEVER ONE. Building the command and executing it are separate
 buttons, because a deck run ends by uploading its PNGs to Google Drive — a misclick is an
 outward-facing action, not just some wasted minutes.
@@ -71,6 +82,8 @@ import simstore  # noqa: E402  — the store reader, already written and already
 
 REGISTRY_JL = os.path.join(REPO, "Model_3", "registry.jl")
 PLOTTING_JL = os.path.join(REPO, "Model_3", "plotting.jl")
+PROTOCOL_JL = os.path.join(REPO, "Protocol.jl")
+MAIN_JL = [os.path.join(REPO, f"Model_{n}", "main.jl") for n in ("3", "4", "5", "1")]
 
 
 def _uncommented(path: str) -> str:
@@ -161,9 +174,97 @@ def parse_experiment_suffixes() -> list[str]:
     return [s for s in m.group(1).split("|") if s]
 
 
+def parse_experiment_for() -> dict[tuple[str, str], str]:
+    """`EXPERIMENT_FOR` — (protocol, ramp_target) -> experiment — out of the models' own
+    main.jl.
+
+    THIS IS THE MAPPING THE BOARD WAS MISSING. A deck is `<experiment>_<suffix>`, and the
+    experiment is not a label: main.jl DERIVES it from (PROTOCOL, RAMP_TARGET) and
+    registry.jl derives the H5 path from it. So a command that names a deck but not its
+    protocol does not draw that deck at the default protocol — it solves a DIFFERENT
+    experiment and files it under a different folder, then draws the deck you asked for
+    from whatever older exports happen to be there. `_DECK=jugular_compression_m1_vs_m4`
+    with no `_PROTOCOL` writes `postural_changes/`, and nothing in the run says so.
+
+    Read backwards (experiment -> the pair that produces it) this is also what lets the
+    board FILL IN the protocol from the deck you clicked, which is the only reason a
+    third and fourth control here do not become two more things to get wrong by hand.
+
+    Every model's table is read and they must agree — they are copies of one table, and
+    two copies that have drifted is precisely the thing worth failing on.
+    """
+    pairs: dict[tuple[str, str], str] = {}
+    for path in MAIN_JL:
+        if not os.path.isfile(path):
+            continue
+        block = re.search(r"EXPERIMENT_FOR\s*=\s*Dict\((.*?)\n\s*\)",
+                          _uncommented(path), re.S)
+        if not block:
+            continue
+        for m in re.finditer(r'\(\s*:(\w+)\s*,\s*:(\w+)\s*\)\s*=>\s*"(\w+)"',
+                             block.group(1)):
+            proto, ramp, experiment = m.groups()
+            was = pairs.setdefault((proto, ramp), experiment)
+            if was != experiment:
+                raise SystemExit(
+                    f"deckboard: the EXPERIMENT_FOR tables disagree — ({proto}, {ramp}) "
+                    f"is \"{was}\" in one main.jl and \"{experiment}\" in {path}.")
+    if not pairs:
+        raise SystemExit(f"deckboard: could not parse EXPERIMENT_FOR from any of "
+                         f"{', '.join(MAIN_JL)} — the table moved, fix "
+                         f"parse_experiment_for().")
+    return pairs
+
+
+def parse_ramp_defaults() -> dict[str, tuple[float, str]]:
+    """protocol -> (peak, unit) when `_RAMP_AMP` is NOT set, from Protocol.jl's two
+    `something(RAMP_AMP, …)` defaults.
+
+    Only ever shown, never sent: it is the placeholder that makes an empty AMP box mean
+    something specific ("70 °") rather than "whatever the repo says today". So unlike the
+    parsers above this one does not raise — a missed default costs a vaguer label, where a
+    missed deck->runs mapping would cost a wrong picture.
+    """
+    out: dict[str, tuple[float, str]] = {}
+    try:
+        src = _uncommented(PROTOCOL_JL)
+    except OSError:
+        return out
+    for proto, const, unit in (("angle", "Θ_PEAK_DEG", "°"),
+                               ("pressure", "P_PEAK_MMHG", "mmHg"),
+                               ("qprod", "Q_PEAK_ML_MIN", "mL/min")):
+        m = re.search(const + r"\s*=\s*something\(RAMP_AMP,\s*([\d.eE\s*+/-]+?)\)", src)
+        if m and re.fullmatch(r"[\d.eE\s*+/-]+", m.group(1)):
+            try:
+                out[proto] = (float(eval(m.group(1), {"__builtins__": {}}, {})), unit)
+            except (ValueError, SyntaxError, ZeroDivisionError):
+                pass
+    return out
+
+
 REGISTRY = parse_registry()
 DECK_CHAIN, DECK_FALLBACK = parse_deck_models()
 SUFFIXES = parse_experiment_suffixes()
+EXPERIMENT_FOR = parse_experiment_for()
+RAMP_DEFAULTS = parse_ramp_defaults()
+
+# The two selectors, in the order the radio rows show them. PROTOCOLS is every protocol
+# the table knows; `ramps_for` is which boundaries that protocol can drive — one for
+# :angle and :static, two for :pressure — so a pair the models have no experiment for is
+# not something the window can be put into.
+PROTOCOLS = list(dict.fromkeys(p for p, _ in EXPERIMENT_FOR))
+
+
+def ramps_for(protocol: str) -> list[str]:
+    return [r for p, r in EXPERIMENT_FOR if p == protocol] or ["Theta"]
+
+
+def pair_for_deck(deck: str) -> tuple[str, str] | None:
+    """The (protocol, ramp_target) that produces this deck's experiment, read backwards
+    out of EXPERIMENT_FOR. None for a folder whose stem is no experiment any model
+    derives — a sweep, or a name that predates the table."""
+    experiment = experiment_of(deck)
+    return next((pair for pair, exp in EXPERIMENT_FOR.items() if exp == experiment), None)
 
 
 def experiment_of(deck: str) -> str:
@@ -525,6 +626,25 @@ def job_for(deck: str, model: str) -> dict | None:
     return next(iter(jobs.values())) if len(jobs) == 1 else None
 
 
+def selection_for_deck(deck: str, model: str) -> tuple[str, str]:
+    """The (protocol, ramp_target) this deck is MEANT to be run at, so the two selectors
+    can fill themselves in from the deck rather than be remembered.
+
+    EXPERIMENT_FOR read backwards is the authority — it is the table main.jl derives the
+    experiment from, so a pair it gives back really does write the folder the deck name
+    says. It only fails on a sweep, whose folder is `<experiment>_<label>_sweep` and so
+    matches no experiment; the JOBS table names those explicitly, which is why it is the
+    fallback and not the other way round.
+    """
+    pair = pair_for_deck(deck)
+    if pair:
+        return pair
+    job = job_for(deck, model)
+    if job:
+        return job.get("protocol", "angle"), job.get("ramp_target", "Theta")
+    return "angle", "Theta"
+
+
 def replot_driver(job: dict) -> str | None:
     """The script that redraws without solving, if the job's model has one. M1 has no
     replot_deck.jl, and saying so is better than pinning a vintage onto an entry point that
@@ -591,28 +711,54 @@ def launch_in_terminal(argv: list[str], env: dict[str, str], title: str) -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def build_command(model: str, deck: str, run_ids: list[str], extra: str,
-                  plot: bool, pin: str = "") -> tuple[list[str], dict[str, str], str]:
+                  plot: bool, pin: str = "", protocol: str = "angle",
+                  ramp: str = "Theta", amp: str = "") -> tuple[list[str], dict[str, str], str]:
     """(argv, env-overlay, the copy-pasteable line). One place, so what the window SHOWS,
     what it RUNS and what COPY gives you cannot drift — all three render from this dict.
 
+    THE PROTOCOL IS ALWAYS WRITTEN OUT, on both paths and even when it is the default.
+    This used to be left off the solving command entirely, and leaving it off is not
+    "unspecified" — it is `_PROTOCOL=angle`, main.jl's default, which derives the
+    experiment `postural_changes` and writes there. So a `jugular_compression_*` deck ran
+    from this window solved a TILT, filed it under postural_changes/, and then drew the
+    jugular deck from whatever stale pressure exports were already on disk. Nothing
+    errored, because nothing was wrong with the run — only with which run it was. Named
+    explicitly, the line is also the one in the notes:
+
+        _MODEL=4 _DECK=jugular_compression_m1_vs_m4 _RUN_IDS=m4,m4p \
+            _PROTOCOL=pressure _RAMP_TARGET=Pext julia --project=. main.jl
+
+    `amp` is `_RAMP_AMP` — HOW FAR the ramp goes, degrees or mmHg by protocol (Protocol.jl
+    owns both, and the units). Empty means "do not set it", which is not the same as
+    sending its default: an unset knob follows Protocol.jl if that file changes, and it
+    keeps the command short for the case that is still 90% of runs.
+
     WITH A PIN it is a DIFFERENT command, not the same one with a variable bolted on. A
     pinned vintage means "draw what is already on disk", and that is replot_deck.jl — or
-    main_sweep.jl with _REPLOT=1 for a sweep — plus the deck's protocol out of the JOBS
-    table. main.jl would accept _SIM_STAMP and then solve anyway, which is the one outcome
-    a pin is chosen to avoid. When the model has no replot driver, or the deck is not in
-    the table, it falls back to main.jl carrying the pin and the window says plainly that
-    this will still solve.
+    main_sweep.jl with _REPLOT=1 for a sweep — plus the deck's protocol. main.jl would
+    accept _SIM_STAMP and then solve anyway, which is the one outcome a pin is chosen to
+    avoid. When the model has no replot driver, or the deck is not in the table, it falls
+    back to main.jl carrying the pin and the window says plainly that this will still
+    solve.
     """
     job = job_for(deck, model) if pin else None
     driver = replot_driver(job) if job else None
     if pin and job and driver:
-        env = {"_SIM_STAMP": pin, "_PROTOCOL": job.get("protocol", "angle"),
+        # The protocol here is the SELECTED one, not the JOBS table's, because selecting
+        # the vintage set it from that vintage's own meta.json — what was actually solved
+        # beats what the table says should redraw it, and they only differ when one of
+        # them is wrong.
+        env = {"_SIM_STAMP": pin, "_PROTOCOL": protocol, "_RAMP_TARGET": ramp,
                # A sweep folder is drawn by the analysis deck it belongs to, so the _DECK
                # here is the table's, not the folder you clicked.
                "_DECK": job.get("deck", deck)}
+        if amp.strip():
+            # Does not change a redraw — a replot solves nothing — but it keeps `params`
+            # describing the vintage being drawn rather than the default, and selecting
+            # an export fills this in from that export's own meta.json.
+            env["_RAMP_AMP"] = amp.strip()
         if job["kind"] == "sweep":
-            env.update(_SWEEP=job.get("sweep", ""), _REPLOT="1", _SIM_MODE="1",
-                       _RAMP_TARGET=job.get("ramp_target", "Theta"))
+            env.update(_SWEEP=job.get("sweep", ""), _REPLOT="1", _SIM_MODE="1")
         elif job.get("beats_models"):
             env["_BEATS_MODELS"] = job["beats_models"]
         argv = ["julia", "--project=.", driver]
@@ -622,6 +768,10 @@ def build_command(model: str, deck: str, run_ids: list[str], extra: str,
         env["_SIM_STAMP"] = pin
     if run_ids:
         env["_RUN_IDS"] = ",".join(run_ids)
+    env["_PROTOCOL"] = protocol
+    env["_RAMP_TARGET"] = ramp
+    if amp.strip():
+        env["_RAMP_AMP"] = amp.strip()
     if not plot:
         env["_NOPLOT"] = "1"
     # Free-form `K=V K=V`, applied last so it can override anything above — including
@@ -850,6 +1000,10 @@ def main() -> int:
             for r in rows:
                 if r.model == rows[0].model and r.id in id_vars:
                     id_vars[r.id].set(True)
+        # An explicit "load this deck" is exactly when the protocol should come back from
+        # the deck rather than from whatever was selected for the last one.
+        state["pair_touched"] = False
+        sync_pair()
         preview()
 
     for i, d in enumerate(ds):
@@ -948,6 +1102,78 @@ def main() -> int:
     _default = next((d.name for d in _mapped if d.stale),
                     _mapped[0].name if _mapped else "postural_changes_m3_analysis")
     deck_entry = labelled_entry("DECK", _default)
+
+    # --- protocol, ramp target, ramp amplitude ------------------------------
+    # The three things that decide WHAT IS SOLVED, and until now the three things this
+    # window could not say. They sit directly under DECK because they are not independent
+    # of it: the deck names an experiment, and EXPERIMENT_FOR says which pair produces
+    # that experiment — so choosing a deck FILLS THESE IN, and the only reason to touch
+    # them by hand is to run a deck's protocol at something other than its usual setting.
+    #
+    # Once touched they stay put (state["pair_touched"]), because a selector that silently
+    # reset itself when you edited the deck name would be worse than no selector. Clicking
+    # a deck in PLOTS, or an export in EXPORTS, is an explicit "load this" and does reset
+    # it — those are the gestures that mean "give me the right settings for this thing".
+    proto_var = tk.StringVar(value="angle")
+    ramp_var = tk.StringVar(value="Theta")
+
+    prow = tk.Frame(runbox, bg=PANEL)
+    prow.pack(fill="x", padx=8, pady=(4, 0))
+    tk.Label(prow, text="PROTOCOL", bg=PANEL, fg=DIM, font=MONO, width=8,
+             anchor="w").pack(side="left")
+
+    rrow = tk.Frame(runbox, bg=PANEL)
+    rrow.pack(fill="x", padx=8, pady=(2, 0))
+    tk.Label(rrow, text="RAMP", bg=PANEL, fg=DIM, font=MONO, width=8,
+             anchor="w").pack(side="left")
+    ramp_holder = tk.Frame(rrow, bg=PANEL)
+    ramp_holder.pack(side="left")
+
+    def touch_pair():
+        state["pair_touched"] = True
+        rebuild_ramps()
+
+    def rebuild_ramps(*_):
+        """The ramp targets THIS protocol has an experiment for — both boundaries for
+        :pressure, Theta alone for :angle and :static. A pair outside the table has no
+        experiment to be filed under, so it is not offered rather than warned about."""
+        for w in ramp_holder.winfo_children():
+            w.destroy()
+        opts = ramps_for(proto_var.get())
+        if ramp_var.get() not in opts:
+            ramp_var.set(opts[0])
+        for r in opts:
+            tk.Radiobutton(ramp_holder, text=f" {r} ", value=r, variable=ramp_var,
+                           command=lambda: (state.update(pair_touched=True), preview()),
+                           bg=PANEL, fg=ACCENT2, selectcolor=EDGE, activebackground=EDGE,
+                           activeforeground=BG, font=MONO_B, indicatoron=False, bd=0,
+                           width=7).pack(side="left", padx=2)
+        preview()
+
+    for pname in PROTOCOLS:
+        tk.Radiobutton(prow, text=f" {pname} ", value=pname, variable=proto_var,
+                       command=touch_pair, bg=PANEL, fg=ACCENT2, selectcolor=EDGE,
+                       activebackground=EDGE, activeforeground=BG, font=MONO_B,
+                       indicatoron=False, bd=0, width=9).pack(side="left", padx=2)
+
+    amp_entry = labelled_entry("AMP", "")
+    amp_lbl = tk.Label(runbox, text="", bg=PANEL, fg=DIM,
+                       font=("DejaVu Sans Mono", 8), anchor="w")
+    amp_lbl.pack(fill="x", padx=8)
+
+    def sync_pair(force: bool = False):
+        """Put the selectors where the DECK says they belong, unless they were set by
+        hand. Called on every edit of the deck name, so a deck typed in is as correct as
+        one clicked."""
+        if state["pair_touched"] and not force:
+            return
+        proto, ramp = selection_for_deck(deck_entry.get().strip(), model_var.get())
+        proto_var.set(proto)
+        ramp_var.set(ramp)
+        rebuild_ramps()
+
+    deck_entry.bind("<KeyRelease>", lambda _e: sync_pair())
+
     extra_entry = labelled_entry("EXTRA", "")
     tk.Label(runbox, text="         e.g.  _T_END=2000 _XLIM=0,2000 _REUSE=1"
                           "   (applied last — can override anything above)",
@@ -971,13 +1197,14 @@ def main() -> int:
     # The launcher's state. No process lives here: a run is handed to a terminal and
     # forgotten about. "pin" is the vintage clicked in EXPORTS below, and it changes WHICH
     # command gets built rather than just adding a variable to the one that was there.
-    state = {"argv": None, "env": None, "armed": False,
-             "pin": "", "sel": None, "seltag": "", "del_armed": False}
+    state = {"argv": None, "env": None, "armed": False, "pin": "", "sel": None,
+             "seltag": "", "del_armed": False, "pair_touched": False}
 
     def current():
         ids = [k for k, v in id_vars.items() if v.get()]
         return build_command(model_var.get(), deck_entry.get().strip(), ids,
-                             extra_entry.get(), plot_var.get(), state["pin"])
+                             extra_entry.get(), plot_var.get(), state["pin"],
+                             proto_var.get(), ramp_var.get(), amp_entry.get())
 
     def preview(*_):
         argv, env, shown = current()
@@ -987,6 +1214,31 @@ def main() -> int:
         notes = []
         deck = deck_entry.get().strip()
         want = models_of(deck)
+        proto, ramp = proto_var.get(), ramp_var.get()
+        experiment = EXPERIMENT_FOR.get((proto, ramp), "?")
+
+        # What an empty AMP box means, in the unit THIS protocol is read in — and for
+        # :static, that there is no ramp for it to be the amplitude of.
+        if proto == "static":
+            amp_lbl.configure(text="         the static protocol has no ramp — AMP and "
+                                   "RAMP do not reach the solve")
+        else:
+            peak, unit = RAMP_DEFAULTS.get(proto, (None, ""))
+            amp_lbl.configure(
+                text=f"         _RAMP_AMP in {unit or 'the protocol unit'} · blank = "
+                     f"{'%g %s' % (peak, unit) if peak is not None else 'the protocol default'}"
+                     f" · writes simulations/m{model_var.get()}/{experiment}/")
+
+        # THE ONE THAT MATTERS. The experiment is derived from (protocol, ramp), the H5
+        # path is derived from the experiment, and the deck is drawn from whatever is at
+        # that path — so a pair that disagrees with the deck name does not fail, it solves
+        # the other experiment and then draws the deck from exports nobody just made.
+        implied = pair_for_deck(deck)
+        if implied and implied != (proto, ramp) and not state["pin"]:
+            notes.append(f"{proto}/{ramp} solves into {experiment}/, but {deck} is drawn "
+                         f"from {experiment_of(deck)}/ — the deck will be redrawn from "
+                         f"OLDER exports. Was this meant to be "
+                         f"{implied[0]}/{implied[1]}?")
         chosen = [k for k, v in id_vars.items() if v.get()]
         # The deck draws a fixed id set; anything you solve outside it is stored but not
         # drawn, and anything in it you did NOT solve is drawn from an older vintage. A
@@ -1089,6 +1341,21 @@ def main() -> int:
         if x.meta.get("deck"):
             deck_entry.delete(0, "end")
             deck_entry.insert(0, x.meta["deck"])
+        # The vintage RECORDS what it was solved at — protocol, boundary and, since the
+        # ramp became a knob, its amplitude. That beats deriving them from the deck name:
+        # it is the difference between "what this deck is usually run at" and "what this
+        # file on disk actually is", and a vintage solved at a non-default amplitude is
+        # otherwise indistinguishable from one that was not.
+        state["pair_touched"] = False
+        if x.meta.get("protocol"):
+            proto_var.set(x.meta["protocol"])
+            ramp_var.set(x.meta.get("ramp_target", "Theta"))
+            rebuild_ramps()
+        else:
+            sync_pair()
+        amp_entry.delete(0, "end")
+        if x.meta.get("ramp_amp") is not None:
+            amp_entry.insert(0, f"{float(x.meta['ramp_amp']):g}")
         # An output/ .h5 predates the store and has no vintage to pin. It is listed so it
         # can be SEEN and deleted, and the label says why it will not pin.
         pin_lbl.configure(text=(f"{x.stamp} · {x.file}" if x.stamp else
@@ -1104,6 +1371,9 @@ def main() -> int:
             last = (x.stamp, x.family)
             m = x.meta
             bits = "  ".join(b for b in (f"t_end {m['t_end']}" if "t_end" in m else "",
+                                         f"amp {m['ramp_amp']:g}"
+                                         if isinstance(m.get("ramp_amp"), (int, float))
+                                         else "",
                                          m.get("retcode", ""),
                                          f"deck {m['deck']}" if "deck" in m else "") if b)
             xtxt.insert("end", f"\n {x.stamp or '(no vintage)':<16}{x.family}\n", "hdr")
@@ -1189,6 +1459,7 @@ def main() -> int:
               highlightthickness=1).pack(side="right")
 
     rebuild_ids()
+    sync_pair()
     if selftest:
         root.update_idletasks()
         root.update()
@@ -1197,6 +1468,19 @@ def main() -> int:
         print(f"  {len(sims)} vintages · {len(ds)} decks · {nstale} stale")
         print(f"  default command: {shown}")
         assert argv[:1] == ["julia"] and "_DECK" in env, "command builder is wrong"
+        # The protocol is the whole point of the pair of selectors: a command that names a
+        # deck must also name the protocol that writes that deck's experiment, or it
+        # solves a different one. Checked against EXPERIMENT_FOR rather than a literal, so
+        # this follows the models' own table.
+        assert EXPERIMENT_FOR.get((env["_PROTOCOL"], env["_RAMP_TARGET"])) == \
+            experiment_of(env["_DECK"]), \
+            f"{env['_DECK']} would be solved as {env['_PROTOCOL']}/{env['_RAMP_TARGET']}"
+        # And the ramp knob reaches it, in one number.
+        amp_entry.insert(0, "20")
+        assert current()[1].get("_RAMP_AMP") == "20", "_RAMP_AMP did not reach the env"
+        amp_entry.delete(0, "end")
+        assert "_RAMP_AMP" not in current()[1], "an empty AMP box must not set the knob"
+        print(f"  protocols: {PROTOCOLS} · ramp defaults: {RAMP_DEFAULTS}")
         # Exercise the click path too — a deck row is only useful if selecting it really
         # does load its model and its ids into the launcher.
         for d in ds:

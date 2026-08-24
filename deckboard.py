@@ -23,6 +23,18 @@ overlays, finds the export each id resolves to TODAY (newest vintage, same rule 
 uses), and compares that export's mtime against the PNG's. An export newer than the picture
 means the picture is of an older solve, and nothing in the picture says so.
 
+A PICTURE GOES OUT OF DATE TWO WAYS, and only one of them is the exports. The other is the
+DRAWING CODE: plotting.jl, the panels, the registry's labels and colours, and the deck
+folder's own layout.jl. Edit any of them and every PNG already on disk is a rendering of
+the previous version, with the same run behind it — a staleness the export timestamps
+cannot see, and the cheap one to fix, because it is a replot rather than a solve. So each
+deck also carries the closure of the sources that DRAW it, walked from the include graph of
+the replot driver the JOBS table names for it, and the badge says REPLOT when they are the
+only thing that moved.
+
+WHICH BRANCH YOU ARE ON is asked once, above the run button, because a run ends by putting
+PNGs on Google Drive and nothing in that upload records the checkout that drew them.
+
 NO NEW DEPENDENCIES — tkinter, subprocess and the stdlib, plus simstore.py from the repo
 root. It is a .py rather than a notebook because it has to own a window and a subprocess for
 the length of a solve, which a notebook cell does not do well; `--report` is there for when
@@ -418,6 +430,14 @@ class Source:
 
 
 @dataclass
+class Plotter:
+    """One source file that DRAWS this deck, and how it stands against its pictures."""
+    path: str                       # repo-relative: it is a path in this repo, not a file id
+    mtime: datetime
+    newer_than_plot: bool = False
+
+
+@dataclass
 class Deck:
     name: str
     dir: str
@@ -426,6 +446,7 @@ class Deck:
     drawn: datetime | None          # OLDEST png — a deck is only as fresh as its stalest panel
     newest_png: datetime | None
     sources: list[Source] = field(default_factory=list)
+    plotters: list[Plotter] = field(default_factory=list)
 
     @property
     def stale(self) -> list[Source]:
@@ -436,13 +457,26 @@ class Deck:
         return [s for s in self.sources if s.path is None]
 
     @property
+    def edited(self) -> list[Plotter]:
+        """The drawing code that has moved since these PNGs were written, newest first."""
+        return sorted((p for p in self.plotters if p.newer_than_plot),
+                      key=lambda p: p.mtime, reverse=True)
+
+    @property
     def badge(self) -> str:
+        """WORST FIRST, and REPLOT last of the three: a deck whose exports are stale is
+        also being drawn by newer code more often than not, and the badge should name the
+        thing that costs minutes rather than the thing that costs seconds. REPLOT is
+        therefore what is left when the runs behind the picture are fine and only the code
+        that drew it moved on."""
         if self.kind == "unmapped":
             return "?"
         if self.stale:
             return "STALE"
         if self.missing:
             return "NO EXPORT"
+        if self.edited:
+            return "REPLOT"
         return "ok"
 
 
@@ -496,6 +530,13 @@ def decks(sims: list[Sim]) -> list[Deck]:
                 add(variant or "sweep", f"{exp} / {variant or '?'}", None)
             for s in sorted(hits, key=lambda s: s.model):
                 add(f"{s.model}:{variant}", f"{s.model} {variant}", s)
+
+        # The other half of "is this picture still true": not the runs it came from, but
+        # the code that drew it. Same comparison, same oldest-PNG rule.
+        for f in plotter_files(name, kind):
+            t = _when(f)
+            deck.plotters.append(Plotter(os.path.relpath(f, REPO), t,
+                                         deck.drawn is not None and t > deck.drawn))
 
         out.append(deck)
     return out
@@ -652,6 +693,170 @@ def replot_driver(job: dict) -> str | None:
     rel = f"Model_{job['model']}/" + ("main_sweep.jl" if job["kind"] == "sweep"
                                       else "replot_deck.jl")
     return rel if os.path.isfile(os.path.join(REPO, rel)) else None
+
+# ══════════════════════════════════════════════════════════════════════════════
+# THE PLOTTERS
+# ══════════════════════════════════════════════════════════════════════════════
+# WHICH FILES DRAW A DECK is a question with an answer already in the repo — the include
+# graph — so it is walked rather than listed. A list of plotting sources in a Python file
+# would miss the next `include` the day it is written, and miss it silently, which is the
+# same failure mode the parsers above exist to avoid.
+#
+# THE WALK STARTS AT THE REPLOT DRIVER the JOBS table names for this deck, because that is
+# literally the program that redraws it: Model_4/replot_deck.jl reaches into
+# Model_3/plotting.jl, and a hand-written mapping would have had M4 decks watching a
+# plotting.jl that does not exist.
+#
+# IT FOLLOWS ONLY THE DRIVER'S PLOTTING INCLUDE, not everything the driver includes. A
+# driver also pulls in Model.jl, Params.jl and the rest of the solver, and the solver has
+# NO SAY IN A REDRAW — a replot reads an .h5 and draws it. Editing Model.jl invalidates the
+# export (which the store's own timestamps already show); it does not invalidate the
+# picture drawn from that export. Past `plotting.jl` the closure is unrestricted, because
+# everything it reaches — plot_runs.jl, panels_shared.jl, panel_catalogue.jl, registry.jl
+# and its labels and colours — really does change what comes out.
+#
+# AND THE DECK'S OWN layout.jl, which is drawing code that lives in output/<deck>/ and is
+# the one plotter that differs per deck. It is safe to compare: panel_catalogue.jl rewrites
+# it only when the content changes, so a redraw does not touch its mtime and cannot make a
+# deck permanently accuse itself.
+
+SWEEP_PLOTTING_JL = os.path.join(REPO, "Model_3", "plotting_sweep.jl")
+
+# The two include forms these sources use. Anything else — an include of a variable, a
+# computed path — resolves to nothing and drops out of the closure: a plotter that cannot
+# be named is better missing from the comparison than guessed at.
+_INC_STR = re.compile(r'include\(\s*"([^"]+)"\s*\)')
+_INC_JOIN = re.compile(r'include\(\s*joinpath\(([^)]*)\)\s*\)')
+_IS_PLOTTER = re.compile(r'plotting(_sweep)?\.jl$')
+
+
+def _include_targets(path: str) -> list[str]:
+    """Absolute paths of the files `path` includes. Commented-out includes are not
+    includes — hence _uncommented, the same strip the parsers above use."""
+    text = _uncommented(path)
+    here = os.path.dirname(path)
+    out = [os.path.normpath(os.path.join(here, m.group(1))) for m in _INC_STR.finditer(text)]
+    for m in _INC_JOIN.finditer(text):
+        # joinpath(@__DIR__, "..", "Model_3", "plotting.jl") — only the @__DIR__-anchored
+        # form is resolvable from here, and it is the only one the sources use.
+        toks = [here if t.group(0) == "@__DIR__" else t.group(1)
+                for t in re.finditer(r'@__DIR__|"([^"]*)"', m.group(1))]
+        if toks and toks[0] == here:
+            out.append(os.path.normpath(os.path.join(*toks)))
+    return out
+
+
+_CLOSURE: dict[str, list[str]] = {}
+
+
+def plotter_closure(entry: str) -> list[str]:
+    """`entry` and everything it includes, transitively. Cached: plotting.jl is 3000 lines
+    and every deck in the window asks for the same closure."""
+    if entry in _CLOSURE:
+        return _CLOSURE[entry]
+    seen: list[str] = []
+    queue = [entry]
+    while queue:
+        f = queue.pop(0)
+        if f in seen or not os.path.isfile(f):
+            continue
+        seen.append(f)
+        queue += _include_targets(f)
+    _CLOSURE[entry] = seen
+    return seen
+
+
+def plotter_files(deck: str, kind: str) -> list[str]:
+    """Every source that draws this deck folder, absolute paths, deduped.
+
+    BOTH claimants when two models claim the deck. job_for() refuses to pick between them
+    because it has to produce one command; this does not have to pick — a change in either
+    model's drawing code is a reason to look at the folder again.
+
+    The fallback, for a folder no JOBS table names, is Model_3's plotting — which is what
+    the parsers above already treat as the authority, and is a great deal closer to the
+    truth than watching nothing at all.
+    """
+    found: list[str] = []
+
+    def add(f: str) -> None:
+        if os.path.isfile(f) and f not in found:
+            found.append(f)
+
+    for job in REPLOT_JOBS.get(deck, {}).values():
+        rel = replot_driver(job)
+        if rel is None:                       # M1: no replot driver, so nothing to walk
+            continue
+        driver = os.path.join(REPO, rel)
+        add(driver)                           # it chooses the panels, so it is a plotter
+        for inc in _include_targets(driver):
+            if _IS_PLOTTER.search(inc):
+                for f in plotter_closure(inc):
+                    add(f)
+    if not found:
+        for entry in [PLOTTING_JL] + ([SWEEP_PLOTTING_JL] if kind == "sweep" else []):
+            for f in plotter_closure(entry):
+                add(f)
+    add(os.path.join(OUTPUT, deck, "layout.jl"))
+    return found
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WHICH BRANCH
+# ══════════════════════════════════════════════════════════════════════════════
+# A run writes into simulations/ and output/ and then UPLOADS the deck's PNGs to Google
+# Drive. Neither the store, nor the deck folder, nor the upload records which checkout
+# produced them — so a solve started from a side branch makes figures indistinguishable
+# from the ones the shared code makes, and the only trace of the difference is a working
+# tree you may well move off before anyone asks. The board cannot fix that. It can say it,
+# once, in the last place where saying it is still free: directly above the run button.
+
+def _git(*args: str) -> str:
+    """git in the repo, or "". This window has to open with no git installed, on a copy
+    with no .git in it, and mid-rebase — none of which is a reason to fail to open."""
+    try:
+        r = subprocess.run(["git", "-C", REPO, *args], capture_output=True, text=True,
+                           timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def main_branch() -> str:
+    """What "main" is called here. origin/HEAD first — it is the remote's own statement of
+    its default branch — then whichever conventional name actually exists locally."""
+    head = _git("symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
+    if head.startswith("origin/"):
+        return head.split("/", 1)[1]
+    for name in ("main", "master"):
+        if _git("rev-parse", "--verify", "--quiet", f"refs/heads/{name}"):
+            return name
+    return "main"
+
+
+def branch_state() -> tuple[str, str, bool]:
+    """(branch, main, on_main).
+
+    A DETACHED HEAD counts as off-main and says so by name, because it is the worse case of
+    the two: a branch at least still exists to go back to.
+    """
+    branch = _git("rev-parse", "--abbrev-ref", "HEAD")
+    if not branch:
+        return "", "", True            # no git to ask: nothing to warn about
+    if branch == "HEAD":
+        branch = "detached HEAD at " + (_git("rev-parse", "--short", "HEAD") or "?")
+        return branch, main_branch(), False
+    m = main_branch()
+    return branch, m, branch == m
+
+
+def branch_warning() -> str:
+    """The line itself, or "" when there is nothing to say."""
+    branch, m, on_main = branch_state()
+    if on_main or not branch:
+        return ""
+    return (f"⚠ ON {branch} — {m} is the main branch here. What this run solves and "
+            f"uploads is drawn by code that is not on {m}.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """deckboard.py — what has been solved, what has been drawn, and which is stale.
 
-    python3 scripts/deckboard.py            # the window
+    python3 scripts/deckboard.py            # the window (needs tkinter — see below)
     python3 scripts/deckboard.py --report   # the same data as text, no window
+    python3 scripts/deckboard.py --selftest # build the window, render one frame, exit
+
+The window is stdlib, but on Debian/Ubuntu tkinter is a SEPARATE PACKAGE and the stock
+`python3` does not have it: `sudo apt install python3-tk`, or use an interpreter that
+already ships it (`~/anaconda3/bin/python3`). --report and --selftest below say which.
 
 WHY THIS EXISTS. The store and the deck folders answer different halves of one question and
 neither can answer it alone. `simulations/<model>/<experiment>/<variant>/<stamp>/run.h5` says
@@ -471,6 +476,11 @@ class Deck:
         that drew it moved on."""
         if self.kind == "unmapped":
             return "?"
+        # BEFORE stale, because there is nothing to be stale AGAINST. Ranking it by the
+        # runs would call a never-drawn deck `ok` the moment its exports happen to be
+        # older than a folder holding no pictures at all.
+        if not self.pngs:
+            return "UNDRAWN"
         if self.stale:
             return "STALE"
         if self.missing:
@@ -481,12 +491,23 @@ class Deck:
 
 
 def decks(sims: list[Sim]) -> list[Deck]:
-    """Every folder under output/ that holds PNGs, with the runs it overlays resolved the
-    way plot_runs.jl would resolve them right now.
+    """Every deck folder under output/, with the runs it overlays resolved the way
+    plot_runs.jl would resolve them right now.
 
     THE COMPARISON IS AGAINST THE OLDEST PNG, not the newest. A deck is re-rendered as a
     set, but a panel that failed to redraw keeps its old file — and it is that panel, the
     stalest one, that decides whether the FOLDER can be trusted.
+
+    A FOLDER WITH NO PNGs IS LISTED, which it did not used to be, and that omission was
+    the one this board could least afford. `jugular_compression_m1_vs_m4` is in Model_4's
+    JOBS table, has a layout.jl, and had four successful solves filed under it — and it
+    was invisible here, because the only thing it lacked was the pictures. So the deck you
+    most need to draw was the one deck you could not click, and the board's answer to
+    "why did nothing come out" was to not mention the deck at all.
+
+    Not EVERY empty folder, though: an `output/` subfolder with neither PNGs nor a
+    layout.jl is not an undrawn deck, it is a directory. A layout.jl means the catalogue
+    has been here and this is a deck; being in the JOBS table means the same thing.
     """
     by_family: dict[tuple[str, str, str], Sim] = {
         (s.model, s.experiment, s.variant): s for s in sims if s.newest
@@ -499,11 +520,16 @@ def decks(sims: list[Sim]) -> list[Deck]:
         if not os.path.isdir(d):
             continue
         pngs = sorted(f for f in os.listdir(d) if f.endswith(".png"))
-        if not pngs:
+        if not pngs and not (os.path.isfile(os.path.join(d, "layout.jl"))
+                             or name in REPLOT_JOBS):
             continue
         times = [_when(os.path.join(d, f)) for f in pngs]
         kind = deck_kind(name)
-        deck = Deck(name, d, kind, pngs, min(times), max(times))
+        # `drawn` is None with no PNGs, and every `newer_than_plot` test below already
+        # guards on that — so an undrawn deck reports no stale sources rather than all of
+        # them, which is right: nothing was drawn, so nothing drawn is out of date.
+        deck = Deck(name, d, kind, pngs, min(times) if times else None,
+                    max(times) if times else None)
 
         def add(rid: str, label: str, sim: Sim | None):
             if sim is None:
@@ -945,18 +971,33 @@ def build_command(model: str, deck: str, run_ids: list[str], extra: str,
     avoid. When the model has no replot driver, or the deck is not in the table, it falls
     back to main.jl carrying the pin and the window says plainly that this will still
     solve.
+
+    AND SO IS AN EMPTY `run_ids`, for the same reason and by the same route — see the
+    comment on `draw_only` below. A pin says WHICH vintage to draw; no ids ticked says
+    only THAT this is a draw, and the driver then resolves each id to its newest vintage
+    on its own. Both fall back to main.jl the same way when the deck has no driver.
     """
-    job = job_for(deck, model) if pin else None
+    # NO IDS TICKED IS AN INSTRUCTION, not an omission. main.jl with no _RUN_IDS does
+    # the opposite of nothing: it solves EVERY id in that model's registry, minutes of
+    # solving nobody asked for, written over the exports the deck is drawn from. What an
+    # empty tick list actually means here is "solve nothing, draw the deck" — so it goes
+    # to the same replot driver a pin does, just without a _SIM_STAMP: newest vintage of
+    # each id, drawn, solved never. Untick with the draw box OFF and it is left alone,
+    # because "solve everything, draw nothing" is the only reading left once drawing is
+    # off, and it is a real thing to ask for.
+    draw_only = bool(pin) or (plot and not run_ids)
+    job = job_for(deck, model) if draw_only else None
     driver = replot_driver(job) if job else None
-    if pin and job and driver:
+    if draw_only and job and driver:
         # The protocol here is the SELECTED one, not the JOBS table's, because selecting
         # the vintage set it from that vintage's own meta.json — what was actually solved
         # beats what the table says should redraw it, and they only differ when one of
         # them is wrong.
-        env = {"_SIM_STAMP": pin, "_PROTOCOL": protocol, "_RAMP_TARGET": ramp,
-               # A sweep folder is drawn by the analysis deck it belongs to, so the _DECK
-               # here is the table's, not the folder you clicked.
-               "_DECK": job.get("deck", deck)}
+        env = {"_SIM_STAMP": pin} if pin else {}
+        env.update({"_PROTOCOL": protocol, "_RAMP_TARGET": ramp,
+                    # A sweep folder is drawn by the analysis deck it belongs to, so the
+                    # _DECK here is the table's, not the folder you clicked.
+                    "_DECK": job.get("deck", deck)})
         if amp.strip():
             # Does not change a redraw — a replot solves nothing — but it keeps `params`
             # describing the vintage being drawn rather than the default, and selecting
@@ -1120,7 +1161,21 @@ def main() -> int:
     # looking at a screen. It deliberately stops short of mainloop and never spawns julia.
     selftest = "--selftest" in sys.argv
 
-    import tkinter as tk
+    try:
+        import tkinter as tk
+    except ModuleNotFoundError as e:
+        # The window needs Tk; --report above does not, which is why the import lives
+        # here and not at the top. A bare ModuleNotFoundError names `tkinter` and
+        # nothing else — not which interpreter lacks it, and not that the fix is a
+        # SYSTEM package rather than a pip install, which is the part that makes this
+        # look like a broken script rather than a missing dependency.
+        raise SystemExit(
+            f"deckboard: {sys.executable} has no tkinter, so the window cannot open.\n"
+            f"           ({e})\n"
+            "  install it:  sudo apt install python3-tk\n"
+            "  or run under an interpreter that already has it, e.g.\n"
+            "      ~/anaconda3/bin/python3 scripts/deckboard.py\n"
+            "  --report needs no Tk and works on any interpreter.") from None
 
     sims = simulations()
     ds = decks(sims)
@@ -1274,7 +1329,14 @@ def main() -> int:
         for rid in sorted(r.id for r in REGISTRY.values() if r.model == fam):
             v = tk.BooleanVar(value=False)
             id_vars[rid] = v
-            tk.Checkbutton(id_frame, text=rid, variable=v, bg=PANEL, fg=INK,
+            # WITHOUT `command` these were the only controls in the window that did not
+            # redraw the line below them: ticking or unticking an id changed what ARM
+            # would run — `spawn` rebuilds from `current()` — while the command on screen
+            # still showed the previous set. Untick everything and _RUN_IDS stayed
+            # written up there, which is the one case where the displayed command and the
+            # one that runs mean OPPOSITE things: a draw shown as a solve.
+            tk.Checkbutton(id_frame, text=rid, variable=v, command=lambda: preview(),
+                           bg=PANEL, fg=INK,
                            selectcolor=BG, activebackground=PANEL, activeforeground=ACCENT,
                            font=MONO, bd=0, highlightthickness=0).pack(side="left")
         preview()
@@ -1285,8 +1347,8 @@ def main() -> int:
                        activebackground=EDGE, activeforeground=BG, font=MONO_B,
                        indicatoron=False, bd=0, width=5).pack(side="left", padx=2)
 
-    tk.Label(runbox, text="RUN IDS", bg=PANEL, fg=DIM, font=MONO,
-             anchor="w").pack(fill="x", padx=8, pady=(6, 0))
+    tk.Label(runbox, text="RUN IDS   (none ticked = redraw the deck, solve nothing)",
+             bg=PANEL, fg=DIM, font=MONO, anchor="w").pack(fill="x", padx=8, pady=(6, 0))
     id_frame.pack(fill="x", padx=8)
 
     def labelled_entry(text, default=""):
@@ -1391,9 +1453,51 @@ def main() -> int:
                    font=MONO, bd=0, highlightthickness=0, anchor="w").pack(fill="x",
                                                                           padx=8, pady=(4, 0))
 
-    cmd_lbl = tk.Label(runbox, text="", bg=BG, fg=ACCENT2, font=MONO, anchor="w",
-                       justify="left", wraplength=430)
-    cmd_lbl.pack(fill="x", padx=8, pady=6)
+    # THE COMMAND, AS TEXT A CURSOR CAN BE DRAGGED THROUGH. It was a Label, and a Label
+    # holds no selection — so COPY was the only way this line got out of the window, and
+    # Tk's clipboard belongs to THIS process: it empties when deckboard closes, which is
+    # exactly when you go to paste it into a terminal. A Text keeps the selection, answers
+    # Ctrl+C, and on X11 puts it in PRIMARY as well, so middle-click works too.
+    #
+    # It stays in `normal` state and refuses edits through its bindings instead of being
+    # `disabled`, because a disabled Text takes no keyboard focus on some builds and
+    # Ctrl+C from the keyboard is half the point.
+    cmd_txt = tk.Text(runbox, bg=BG, fg=ACCENT2, font=MONO, bd=0, height=3, wrap="word",
+                      highlightbackground=EDGE, highlightthickness=1, padx=4, pady=3,
+                      selectbackground=EDGE, selectforeground=INK, cursor="xterm",
+                      insertbackground=ACCENT)
+    cmd_txt.pack(fill="x", padx=8, pady=6)
+
+    _NAV = {"Left", "Right", "Up", "Down", "Home", "End", "Prior", "Next",
+            "Shift_L", "Shift_R", "Control_L", "Control_R", "Alt_L", "Alt_R"}
+
+    def _readonly(event):
+        """Let through what reads, swallow what writes. Ctrl-modified c/a/x and the
+        motion keys move a selection about; everything else would edit a line whose
+        whole value is that it is the line that will run."""
+        if event.state & 4 and event.keysym.lower() in ("c", "a", "insert"):
+            return None
+        return None if event.keysym in _NAV else "break"
+
+    cmd_txt.bind("<Key>", _readonly)
+    cmd_txt.bind("<<Cut>>", lambda _e: "break")
+    cmd_txt.bind("<<Paste>>", lambda _e: "break")
+    cmd_txt.bind("<Button-2>", lambda _e: "break")          # X11 middle-click paste
+    cmd_txt.bind("<Control-a>",
+                 lambda _e: (cmd_txt.tag_add("sel", "1.0", "end-1c"), "break")[1])
+
+    def set_cmd(text: str) -> None:
+        """Grow to fit rather than scroll — a command you have to scroll to read is one
+        you cannot check before arming it."""
+        cmd_txt.delete("1.0", "end")
+        cmd_txt.insert("1.0", text)
+        cmd_txt.update_idletasks()      # -displaylines needs the wrap already applied
+        try:
+            n = cmd_txt.count("1.0", "end", "displaylines")
+            n = int(n[0] if isinstance(n, (list, tuple)) else n)
+        except (TypeError, ValueError, tk.TclError):
+            n = 3
+        cmd_txt.configure(height=max(2, min(n, 8)))
 
     warn_lbl = tk.Label(runbox, text="", bg=PANEL, fg=WARN, font=MONO, anchor="w",
                         justify="left", wraplength=430)
@@ -1414,7 +1518,7 @@ def main() -> int:
     def preview(*_):
         argv, env, shown = current()
         state.update(argv=argv, env=env, armed=False)
-        cmd_lbl.configure(text=shown)
+        set_cmd(shown)
         run_btn.configure(text="▶ ARM", bg=EDGE)
         notes = []
         deck = deck_entry.get().strip()
@@ -1451,6 +1555,17 @@ def main() -> int:
         if chosen and not state["pin"] and not set(chosen) & set(want):
             notes.append(f"none of {', '.join(chosen)} is drawn by {deck} "
                          f"(it overlays {', '.join(want)})")
+        # THE SAME TRAP, reached the other way. No ids ticked is read as "draw only", but
+        # that reading needs a replot driver to carry it — and without one it falls back to
+        # main.jl with no _RUN_IDS, which is not a small solve, it is EVERY id this model
+        # has. Said here because the command line itself looks innocuous: it is the
+        # variable that ISN'T in it that costs the afternoon.
+        if plot_var.get() and not chosen and not state["pin"]:
+            job = job_for(deck, model_var.get())
+            if job is None or replot_driver(job) is None:
+                notes.append(f"no ids ticked and no replot driver for {deck} — this "
+                             f"cannot draw-only, it will SOLVE every M{model_var.get()} "
+                             f"run id ({', '.join(sorted(id_vars))})")
         # A pin that cannot reach a replot driver is the one case where the button does the
         # OPPOSITE of what clicking an export means, so it is said plainly rather than left
         # to be discovered when the terminal starts solving.
@@ -1643,9 +1758,28 @@ def main() -> int:
     run_btn.pack(side="left")
 
     def copy():
+        """Onto the SYSTEM clipboard wherever there is one. Tk's own clipboard is owned by
+        this process and is emptied the moment the window closes — so the old copy-then-
+        close-then-paste got you nothing, silently, which is a worse outcome than no COPY
+        button at all. wl-copy and xclip hand it to something that outlives us; Tk stays as
+        the fallback, and the label says WHICH it got so an empty paste is not a mystery."""
+        line = current()[2]
+        for tool in (["wl-copy"], ["xclip", "-selection", "clipboard"]):
+            exe = shutil.which(tool[0])
+            if exe is None:
+                continue
+            try:
+                subprocess.run([exe, *tool[1:]], input=line.encode(), check=True,
+                               timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            launch_lbl.configure(text=f"(command copied — {tool[0]})", fg=ACCENT2)
+            return
         root.clipboard_clear()
-        root.clipboard_append(current()[2])
-        launch_lbl.configure(text="(command copied to clipboard)", fg=ACCENT2)
+        root.clipboard_append(line)
+        root.clipboard_get()            # own the selection before anyone asks for it
+        launch_lbl.configure(text="(copied to Tk's own clipboard — it empties when this "
+                                  "window closes; select the line above instead)", fg=WARN)
 
     tk.Button(btns, text="COPY", command=copy, bg=PANEL, fg=ACCENT2,
               activebackground=EDGE, activeforeground=BG, font=MONO_B, bd=0,
@@ -1671,7 +1805,7 @@ def main() -> int:
         argv, env, shown = current()
         print("deckboard --selftest: widget tree built and rendered")
         print(f"  {len(sims)} vintages · {len(ds)} decks · {nstale} stale")
-        print(f"  default command: {shown}")
+        print(f"  default command (nothing ticked, so a draw): {shown}")
         assert argv[:1] == ["julia"] and "_DECK" in env, "command builder is wrong"
         # The protocol is the whole point of the pair of selectors: a command that names a
         # deck must also name the protocol that writes that deck's experiment, or it
@@ -1711,7 +1845,20 @@ def main() -> int:
             script = terminal_script(argv, env, "deckboard: t")
             assert "_SIM_STAMP" in script and "read -r -p" in script, "bad terminal script"
             clear_pin()
-            assert current()[0][-1] == "main.jl", "clearing the pin did not restore main.jl"
+            # Clearing the pin does NOT go back to solving on its own — `select` unticks
+            # every id, and no ids ticked is still a draw. Ticking one is what makes it a
+            # solve, and that round trip is the whole of the new rule.
+            assert current()[0][-1] != "main.jl", \
+                "with no ids ticked the board must draw, not solve"
+            rid = sorted(id_vars)[0]
+            id_vars[rid].set(True)
+            argv, env, shown = current()
+            assert argv[-1] == "main.jl" and env.get("_RUN_IDS") == rid, \
+                f"ticking {rid} did not restore the solving entry point: {shown}"
+            print(f"  ticked {rid}:")
+            print(f"    {shown}")
+            id_vars[rid].set(False)
+            assert "_RUN_IDS" not in current()[1], "unticking left _RUN_IDS in the command"
         print(f"  terminals available: "
               f"{[n for n, _ in TERMINALS if shutil.which(n)] or 'NONE — set $TERMINAL'}")
         root.destroy()

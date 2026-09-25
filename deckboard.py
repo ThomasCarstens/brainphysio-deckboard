@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
 """deckboard.py — what has been solved, what has been drawn, and which is stale.
 
-    python3 scripts/deckboard.py            # the window (needs tkinter — see below)
-    python3 scripts/deckboard.py --report   # the same data as text, no window
-    python3 scripts/deckboard.py --selftest # build the window, render one frame, exit
+    python3 deckboard/deckboard.py            # the window (needs tkinter — see below)
+    python3 deckboard/deckboard.py --report   # the same data as text, no window
+    python3 deckboard/deckboard.py --selftest # build the window, render one frame, exit
+    python3 deckboard/deckboard.py --repo PATH ...   # read another checkout
+
+WHERE IT LIVES. Deckboard is its own repository, checked out as a git submodule at
+`deckboard/` in the brainphysio repo (human_m123), so a `git clone --recursive` brings it
+and a plain clone does not. It reads the checkout it sits in — the folder above its own —
+unless `--repo PATH` or $DECKBOARD_REPO names another one.
 
 The window is stdlib, but on Debian/Ubuntu tkinter is a SEPARATE PACKAGE and the stock
 `python3` does not have it: `sudo apt install python3-tk`, or use an interpreter that
@@ -11,9 +17,9 @@ already ships it (`~/anaconda3/bin/python3`). --report and --selftest below say 
 
 WHY THIS EXISTS. The store and the deck folders answer different halves of one question and
 neither can answer it alone. `simulations/<model>/<experiment>/<variant>/<stamp>/run.h5` says
-what has been SOLVED; `output/<deck>/*.png` says what has been DRAWN. Nothing on disk joins
+what has been SOLVED; `modelplots/<deck>/*.png` says what has been DRAWN. Nothing on disk joins
 them — the deck's provenance stamp is only written when `_STAMP_OUT` is set, and it is
-deliberately kept out of `output/` so it cannot be committed. So "is this figure still
+deliberately kept out of `modelplots/` so it cannot be committed. So "is this figure still
 telling the truth about the runs it came from?" was a question you answered by reading
 timestamps by hand, across two trees, against a deck→runs mapping that lives in a `?:` chain
 in the middle of plotting.jl.
@@ -76,6 +82,7 @@ remove any of it.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -85,9 +92,61 @@ import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+def _repo() -> str:
+    """The checkout this board reads: `--repo PATH`, else $DECKBOARD_REPO, else the folder
+    above this file — which, with Deckboard checked out as the `deckboard/` submodule, is
+    the brainphysio repo it was cloned into. RESCAN re-execs with the same argv, so a
+    --repo survives it."""
+    for i, a in enumerate(sys.argv):
+        if a == "--repo" and i + 1 < len(sys.argv):
+            return os.path.abspath(sys.argv[i + 1])
+        if a.startswith("--repo="):
+            return os.path.abspath(a.split("=", 1)[1])
+    return os.path.abspath(os.environ.get("DECKBOARD_REPO") or
+                           os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+REPO = _repo()
+if not os.path.isfile(os.path.join(REPO, "simstore.py")):
+    raise SystemExit(f"deckboard: {REPO} is not a brainphysio checkout (no simstore.py).\n"
+                     "  Run it from the submodule — python3 deckboard/deckboard.py — or "
+                     "point it at one with --repo PATH.")
 sys.path.insert(0, REPO)
 import simstore  # noqa: E402  — the store reader, already written and already correct
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# THE MODEL FOLDERS
+# ══════════════════════════════════════════════════════════════════════════════
+# The one piece of the layout stated here rather than parsed. The registry names runs by
+# model id — m1, m3, m4 … — and nothing in the Julia says which folder a model id's sources
+# live in. Since the rename the two no longer line up: m3 is Model_3_celia, m4 is Model_3,
+# and the fitted models sit under fits/. Every folder has to exist or the board does not
+# open, because a missing one means this is not a checkout of the human family, and a
+# guessed folder is a solve sent to the wrong main.jl.
+
+MODEL_DIRS = {
+    "1": "Model_1",
+    "3": "Model_3_celia",
+    "4": "Model_3",
+    "5": "fits/m3/Model_5",
+    "6": "fits/m3/Model_6",
+    "7": "fits/m1/Model_7",
+}
+
+# How each model SOLVES. Every model but M7 has a main.jl. M7's runs come out of
+# ude_cs.jl's export stage, which solves the fitted M1 with its stock and its learned
+# spinal law for one patient — all four of its registry rows at once — and draws nothing
+# (fits/m1/Model_7/README.md). Its deck is then drawn like every patient deck, below.
+SOLVE_ENTRY = {m: "main.jl" for m in MODEL_DIRS} | {"7": "ude_cs.jl"}
+SOLVE_FLAGS = {"7": ["-t", "auto"]}
+SOLVE_ENV = {"7": {"_STAGE": "export"}}
+
+_absent = [d for d in MODEL_DIRS.values() if not os.path.isdir(os.path.join(REPO, d))]
+if _absent:
+    raise SystemExit(f"deckboard: {REPO} has no {', '.join(_absent)}.\n"
+                     "  Deckboard reads the human family's layout (M1–M7, branch "
+                     "human_m123); this checkout is something else.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -97,10 +156,10 @@ import simstore  # noqa: E402  — the store reader, already written and already
 # parser raises if it finds nothing: a regex that silently stops matching would leave this
 # window showing an empty, confident, wrong picture — worse than failing to open.
 
-REGISTRY_JL = os.path.join(REPO, "Model_3", "registry.jl")
-PLOTTING_JL = os.path.join(REPO, "Model_3", "plotting.jl")
+REGISTRY_JL = os.path.join(REPO, "plotter", "registry.jl")
+PLOTTING_JL = os.path.join(REPO, "plotter", "plotting.jl")
 PROTOCOL_JL = os.path.join(REPO, "Protocol.jl")
-MAIN_JL = [os.path.join(REPO, f"Model_{n}", "main.jl") for n in ("3", "4", "5", "1")]
+MAIN_JL = [os.path.join(REPO, MODEL_DIRS[n], "main.jl") for n in ("3", "4", "5", "6", "1")]
 
 
 def _uncommented(path: str) -> str:
@@ -124,11 +183,91 @@ _SHUNT_TAG = {"none": "", "va": "_vashunt", "vp": "_vpshunt",
 
 @dataclass(frozen=True)
 class Row:
+    """One MODEL_REGISTRY entry. `variant_tpl` and `label_tpl` carry `{patient}` where
+    registry.jl interpolates PATIENT_TAG: an M5 row is not one store family but one per
+    recording, and which one a deck overlays depends on the deck (see patient_of)."""
     id: str
     model: str
-    variant: str
-    label: str
+    variant_tpl: str
+    label_tpl: str
     color: str
+
+    @property
+    def per_patient(self) -> bool:
+        return "{patient}" in self.variant_tpl
+
+    def variant(self, patient: str = "") -> str:
+        return self.variant_tpl.replace("{patient}", patient or DEFAULT_PATIENT)
+
+    def label(self, patient: str = "") -> str:
+        return self.label_tpl.replace("{patient}", patient or DEFAULT_PATIENT)
+
+
+_TAG_RX = re.compile(r"\$\(?PATIENT_TAG\)?")
+
+
+def _split_concat(expr: str) -> list[str]:
+    """`a * b * c` at the top level — not inside a string or a call."""
+    parts, depth, quoted, cur = [], 0, False, ""
+    for ch in expr:
+        if ch == '"':
+            quoted = not quoted
+        elif not quoted and ch in "([":
+            depth += 1
+        elif not quoted and ch in ")]":
+            depth -= 1
+        if ch == "*" and not quoted and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += ch
+    return parts + [cur]
+
+
+def _variant_expr(expr: str) -> str:
+    """A registry.jl variant EXPRESSION as a template. The forms it writes: a literal,
+    interpolated or not (`"nonpulsatile_p$(PATIENT_TAG)_nnA"`), `_variant(puls[, :shunt])`,
+    and bare `PATIENT_TAG`, joined by `*`. Anything else raises rather than being guessed
+    at: a wrong variant is a deck resolved against a store family it never drew from."""
+    out = []
+    for part in (p.strip() for p in _split_concat(expr)):
+        lit = re.fullmatch(r'"([^"]*)"', part)
+        call = re.fullmatch(r"_variant\(\s*(true|false)\s*(?:,\s*:(\w+)\s*)?\)", part)
+        if lit:
+            out.append(_TAG_RX.sub("{patient}", lit.group(1)))
+        elif call:
+            out.append(("pulsatile" if call.group(1) == "true" else "nonpulsatile")
+                       + _SHUNT_TAG[call.group(2) or "none"])
+        elif part == "PATIENT_TAG":
+            out.append("{patient}")
+        else:
+            raise SystemExit(f"deckboard: cannot read the variant expression `{expr}` in "
+                             f"{REGISTRY_JL} — extend _variant_expr().")
+    return "".join(out)
+
+
+def parse_default_patient() -> str:
+    """PATIENT_TAG's fallback — the recording a deck is drawn for when neither its name
+    nor its deck.json says."""
+    m = re.search(r'PATIENT_TAG\s*=.*?get\(ENV,\s*"_PATIENT",\s*"(\w+)"\)',
+                  _uncommented(REGISTRY_JL))
+    return m.group(1) if m else "081"
+
+
+def parse_patient_models(src: str) -> set[str]:
+    """Which models' `_row`s carry the patient: `model in ("m5", "m6") ? _m5_variant …`.
+    A registry that tags some rows and whose selector this cannot read raises — reading it
+    as "none" would resolve every M5 deck against a family that no longer exists."""
+    m = re.search(r"model\s+in\s+\(([^)]*)\)\s*\?\s*_m5_variant", src)
+    if m:
+        return set(re.findall(r'"(\w+)"', m.group(1)))
+    m = re.search(r'model\s*==\s*"(\w+)"\s*\?\s*_m5_variant', src)
+    if m:
+        return {m.group(1)}
+    if "_m5_variant" in src:
+        raise SystemExit(f"deckboard: {REGISTRY_JL} tags rows by patient but the selector "
+                         "moved — fix parse_patient_models().")
+    return set()
 
 
 def parse_registry() -> dict[str, Row]:
@@ -140,6 +279,7 @@ def parse_registry() -> dict[str, Row]:
     """
     src = _uncommented(REGISTRY_JL)
     rows: dict[str, Row] = {}
+    tagged = parse_patient_models(src)
 
     for m in re.finditer(
         r':(\w+)\s*=>\s*_row\(\s*"(\w+)"\s*,\s*(true|false)\s*,\s*:(\w+)\s*,\s*"([^"]*)"\s*,\s*"([^"]*)"',
@@ -147,14 +287,19 @@ def parse_registry() -> dict[str, Row]:
     ):
         rid, model, puls, shunt, label, color = m.groups()
         variant = ("pulsatile" if puls == "true" else "nonpulsatile") + _SHUNT_TAG[shunt]
-        rows[rid] = Row(rid, model, variant, label, color)
+        if model in tagged:
+            variant += "_p{patient}"
+        rows[rid] = Row(rid, model, variant, _TAG_RX.sub("{patient}", label), color)
 
+    # The explicit named-tuple rows — the bistability basins, whose variant IS the basin,
+    # and the patient rows (m1pt, m4pt, m7 …), whose variant is an expression.
     for m in re.finditer(
-        r':(\w+)\s*=>\s*\(\s*model\s*=\s*"(\w+)"\s*,\s*variant\s*=\s*"(\w+)"\s*,\s*label\s*=\s*"([^"]*)"\s*,\s*color\s*=\s*"([^"]*)"',
-        src,
+        r':(\w+)\s*=>\s*\(\s*model\s*=\s*"(\w+)"\s*,\s*variant\s*=\s*(.+?)\s*,\s*label\s*=\s*"([^"]*)"\s*,\s*color\s*=\s*"([^"]*)"',
+        src, re.S,
     ):
         rid, model, variant, label, color = m.groups()
-        rows[rid] = Row(rid, model, variant, label, color)
+        rows[rid] = Row(rid, model, _variant_expr(variant),
+                        _TAG_RX.sub("{patient}", label), color)
 
     if len(rows) < 20:
         raise SystemExit(f"deckboard: parsed only {len(rows)} registry rows from "
@@ -162,17 +307,22 @@ def parse_registry() -> dict[str, Row]:
     return rows
 
 
-def parse_deck_models() -> tuple[list[tuple[str, list[str]]], list[str]]:
+def parse_deck_models() -> tuple[list[tuple[re.Pattern, list[str]]], list[str]]:
     """The `endswith(DECK, "_suffix") ? [ids] : …` chain in plotting.jl, in ORDER, plus the
     fallback at its end. Order matters and is preserved: `_bistability_m3_analysis` has to
-    be tested before `_m3_analysis`, exactly as the Julia does."""
+    be tested before `_m3_analysis`, exactly as the Julia does.
+
+    The per-patient branches are `occursin(r"_m5_vs_p\\d+$", DECK)` — an open set, one
+    deck per recording — so both forms are read, each as a pattern, in the one order."""
     src = _uncommented(PLOTTING_JL)
     block = re.search(r"const MODELS = let over(.*?)\n\s*let ids", src, re.S)
     if not block:
         raise SystemExit("deckboard: could not find the MODELS chain in plotting.jl.")
     body = block.group(1)
-    chain = [(m.group(1), re.findall(r":(\w+)", m.group(2)))
-             for m in re.finditer(r'endswith\(DECK,\s*"([^"]+)"\)\s*\?\s*\[([^\]]*)\]', body)]
+    chain = [(re.compile(m.group(2)) if m.group(2) else re.compile(re.escape(m.group(1)) + "$"),
+              re.findall(r":(\w+)", m.group(3)))
+             for m in re.finditer(r'(?:endswith\(DECK,\s*"([^"]+)"\)|occursin\(r"([^"]+)",\s*DECK\))'
+                                  r'\s*\?\s*\[([^\]]*)\]', body)]
     tail = re.findall(r":\s*\n\s*\[([^\]]*)\]\)?\s*:", body)
     fallback = re.findall(r":(\w+)", tail[-1]) if tail else ["m3p", "m3"]
     if len(chain) < 8:
@@ -181,14 +331,17 @@ def parse_deck_models() -> tuple[list[tuple[str, list[str]]], list[str]]:
     return chain, fallback
 
 
-def parse_experiment_suffixes() -> list[str]:
-    """The analysis suffixes registry.jl strips to get EXPERIMENT. Parsed from the same
-    alternation, so a suffix added there is honoured here without an edit."""
+def parse_experiment_suffixes() -> re.Pattern:
+    """The analysis suffixes registry.jl strips to get EXPERIMENT, as the SAME regex.
+    Parsed from its alternation, so a suffix added there is honoured here without an edit
+    — and kept a pattern, because some alternatives are (`m\\d+_vs_p\\d+`, one per
+    recording). Python's alternation is leftmost-first like Julia's, which is what the
+    order in registry.jl relies on."""
     src = _uncommented(REGISTRY_JL)
     m = re.search(r'r"_\(([^)]*)\)\$"\s*=>\s*""', src)
     if not m:
         raise SystemExit("deckboard: could not find the EXPERIMENT suffix regex.")
-    return [s for s in m.group(1).split("|") if s]
+    return re.compile("_(" + m.group(1) + ")$")
 
 
 def parse_experiment_for() -> dict[tuple[str, str], str]:
@@ -259,9 +412,10 @@ def parse_ramp_defaults() -> dict[str, tuple[float, str]]:
     return out
 
 
+DEFAULT_PATIENT = parse_default_patient()
 REGISTRY = parse_registry()
 DECK_CHAIN, DECK_FALLBACK = parse_deck_models()
-SUFFIXES = parse_experiment_suffixes()
+SUFFIX_RE = parse_experiment_suffixes()
 EXPERIMENT_FOR = parse_experiment_for()
 RAMP_DEFAULTS = parse_ramp_defaults()
 
@@ -285,17 +439,43 @@ def pair_for_deck(deck: str) -> tuple[str, str] | None:
 
 
 def experiment_of(deck: str) -> str:
-    for suf in SUFFIXES:
-        if deck.endswith("_" + suf):
-            return deck[: -len(suf) - 1]
-    return deck
+    return SUFFIX_RE.sub("", deck, count=1)
 
 
 def models_of(deck: str) -> list[str]:
-    for suffix, ids in DECK_CHAIN:
-        if deck.endswith(suffix):
+    for rx, ids in DECK_CHAIN:
+        if rx.search(deck):
             return ids
     return DECK_FALLBACK
+
+
+def is_patient_deck(deck: str) -> bool:
+    """Does this deck overlay a per-patient run — an M5/M6/M7 row, or M1/M4 under a
+    patient's stimulus? Those are the decks whose runs depend on WHICH recording."""
+    return deck_kind(deck) == "analysis" and any(
+        REGISTRY[r].per_patient for r in models_of(deck) if r in REGISTRY)
+
+
+def patient_of(deck: str) -> str:
+    """Which recording a patient deck is drawn for. The name says so for every
+    per-recording suffix (`_m5_vs_p083`, `_m1_vs_m7_p137`). The rest (`_m5_vs_data`,
+    `_m6_analysis`) were drawn under whatever _PATIENT the render ran with, and the deck's
+    own deck.json records it in the variants of the runs it drew. Failing both,
+    registry.jl's default."""
+    m = re.search(r"_p(\d+)$", deck)
+    if m:
+        return m.group(1)
+    try:
+        with open(os.path.join(OUTPUT, deck, "deck.json"), encoding="utf-8") as f:
+            runs = json.load(f).get("runs", [])
+    except (OSError, ValueError):
+        runs = []
+    for r in runs:
+        parts = str(r.get("path", "")).split("/")
+        m = re.search(r"_p(\d+)", parts[3]) if len(parts) > 3 else None
+        if m:
+            return m.group(1)
+    return DEFAULT_PATIENT
 
 
 # --- What KIND of folder is this? --------------------------------------------
@@ -307,7 +487,7 @@ def models_of(deck: str) -> list[str]:
 #               SWEEP_VARIANT = "sweep_<label>" — and no registry id names them, so
 #               resolving it through MODEL_REGISTRY finds nothing and reports a folder full
 #               of good figures as having no exports at all.
-#   "unmapped"  everything else under output/ — latex/, ursino_validation/, loose PNGs,
+#   "unmapped"  everything else under modelplots/ — latex/, ursino_validation/, loose PNGs,
 #               folders from a deck name this checkout no longer knows. `models_of` has a
 #               FALLBACK ([:m3p, :m3]) because _DECK accepts anything, and applying it here
 #               would invent two runs for a folder that never had them.
@@ -316,7 +496,7 @@ def models_of(deck: str) -> list[str]:
 # "I do not know what this is" is a true statement, and "NO EXPORT" is not.
 
 def deck_kind(deck: str) -> str:
-    if any(deck.endswith("_" + s) for s in SUFFIXES):
+    if SUFFIX_RE.search(deck):
         return "analysis"
     if deck.endswith("_sweep"):
         return "sweep"
@@ -348,7 +528,7 @@ def sweep_family(deck: str) -> tuple[str, str]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 STORE = simstore.SimStore(REPO)
-OUTPUT = os.path.join(REPO, "output")
+OUTPUT = os.path.join(REPO, "modelplots")
 
 
 def _when(path: str) -> datetime:
@@ -491,7 +671,7 @@ class Deck:
 
 
 def decks(sims: list[Sim]) -> list[Deck]:
-    """Every deck folder under output/, with the runs it overlays resolved the way
+    """Every deck folder under modelplots/, with the runs it overlays resolved the way
     plot_runs.jl would resolve them right now.
 
     THE COMPARISON IS AGAINST THE OLDEST PNG, not the newest. A deck is re-rendered as a
@@ -505,7 +685,7 @@ def decks(sims: list[Sim]) -> list[Deck]:
     most need to draw was the one deck you could not click, and the board's answer to
     "why did nothing come out" was to not mention the deck at all.
 
-    Not EVERY empty folder, though: an `output/` subfolder with neither PNGs nor a
+    Not EVERY empty folder, though: a `modelplots/` subfolder with neither PNGs nor a
     layout.jl is not an undrawn deck, it is a directory. A layout.jl means the catalogue
     has been here and this is a deck; being in the JOBS table means the same thing.
     """
@@ -521,7 +701,7 @@ def decks(sims: list[Sim]) -> list[Deck]:
             continue
         pngs = sorted(f for f in os.listdir(d) if f.endswith(".png"))
         if not pngs and not (os.path.isfile(os.path.join(d, "layout.jl"))
-                             or name in REPLOT_JOBS):
+                             or name in REPLOT_JOBS or is_patient_deck(name)):
             continue
         times = [_when(os.path.join(d, f)) for f in pngs]
         kind = deck_kind(name)
@@ -541,12 +721,14 @@ def decks(sims: list[Sim]) -> list[Deck]:
 
         if kind == "analysis":
             exp = experiment_of(name)
+            patient = patient_of(name) if is_patient_deck(name) else ""
             for rid in models_of(name):
                 row = REGISTRY.get(rid)
                 if row is None:                  # an id the registry no longer carries
                     add(rid, "(not in registry)", None)
                 else:
-                    add(rid, row.label, by_family.get((row.model, exp, row.variant)))
+                    add(rid, row.label(patient),
+                        by_family.get((row.model, exp, row.variant(patient))))
         elif kind == "sweep":
             exp, variant = sweep_family(name)
             # Every model that HAS this sweep family — the deck name does not say which
@@ -607,7 +789,7 @@ def exports() -> list[Export]:
     TWO ROOTS, because there are two kinds. The STORE
     (`simulations/<model>/<experiment>/<variant>/<stamp>/`) is where a solve files its
     exports and where the gigabytes are; its meta.json describes the whole vintage, so
-    every file in one carries the same one. A stray .h5 under `output/` is a deck folder
+    every file in one carries the same one. A stray .h5 under `modelplots/` is a deck folder
     holding its own copy from before the store existed — listed rather than hidden,
     precisely because nothing else in the board accounts for it.
     """
@@ -643,7 +825,7 @@ def exports() -> list[Export]:
 # what a full replot run uses — so it is parsed, like the registry, rather than restated. A
 # deck this cannot find gets no replot offered, instead of one drawn as the wrong protocol.
 
-PLOT_ALL_JL = {n: os.path.join(REPO, f"Model_{n}", "plot_all_decks.jl")
+PLOT_ALL_JL = {n: os.path.join(REPO, MODEL_DIRS[n], "plot_all_decks.jl")
                for n in ("3", "4")}
 
 
@@ -682,12 +864,36 @@ def parse_replot_jobs() -> dict[str, dict[str, dict]]:
 
 REPLOT_JOBS = parse_replot_jobs()
 
+# PATIENT DECKS ARE IN NO JOBS TABLE. plot_all_decks.jl redraws M3's and M4's decks; the
+# per-recording decks are an open set, one per prepared recording, and every one of them is
+# drawn by M5's replot_deck.jl — the driver that loads the recording (Data.jl) before the
+# plotter, which is what makes plotting.jl draw a deck as a PATIENT_DECK. M6's and M7's
+# decks go through it too (fits/m1/Model_7/README.md). So a patient deck's job is built
+# from its name rather than looked up.
+PATIENT_DRIVER_MODEL = "5"
+
+
+def patient_job(deck: str) -> dict | None:
+    if not is_patient_deck(deck):
+        return None
+    protocol, ramp = pair_for_deck(deck) or ("pressure", "Pext")
+    return dict(kind="deck", model=PATIENT_DRIVER_MODEL, deck=deck, protocol=protocol,
+                ramp_target=ramp, patient=patient_of(deck))
+
+
+def jobs_of(deck: str) -> dict[str, dict]:
+    """Every replot job that claims this deck folder, by model."""
+    jobs = REPLOT_JOBS.get(deck, {})
+    if not jobs and (pj := patient_job(deck)):
+        return {pj["model"]: pj}
+    return jobs
+
 
 def job_for(deck: str, model: str) -> dict | None:
     """This deck's replot job: the selected model's if that model draws it, otherwise the
     only model that claims it. Two claimants and neither selected is genuinely ambiguous —
     a sweep folder drawn by M3 and by M4 — so it returns None rather than picking."""
-    jobs = REPLOT_JOBS.get(deck, {})
+    jobs = jobs_of(deck)
     if model in jobs:
         return jobs[model]
     return next(iter(jobs.values())) if len(jobs) == 1 else None
@@ -716,8 +922,8 @@ def replot_driver(job: dict) -> str | None:
     """The script that redraws without solving, if the job's model has one. M1 has no
     replot_deck.jl, and saying so is better than pinning a vintage onto an entry point that
     will cheerfully solve it again."""
-    rel = f"Model_{job['model']}/" + ("main_sweep.jl" if job["kind"] == "sweep"
-                                      else "replot_deck.jl")
+    rel = f"{MODEL_DIRS[job['model']]}/" + ("main_sweep.jl" if job["kind"] == "sweep"
+                                            else "replot_deck.jl")
     return rel if os.path.isfile(os.path.join(REPO, rel)) else None
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -729,9 +935,9 @@ def replot_driver(job: dict) -> str | None:
 # same failure mode the parsers above exist to avoid.
 #
 # THE WALK STARTS AT THE REPLOT DRIVER the JOBS table names for this deck, because that is
-# literally the program that redraws it: Model_4/replot_deck.jl reaches into
-# Model_3/plotting.jl, and a hand-written mapping would have had M4 decks watching a
-# plotting.jl that does not exist.
+# literally the program that redraws it: every model's replot_deck.jl reaches into
+# plotter/plotting.jl, and a hand-written mapping would have had each model's decks
+# watching a plotting.jl in its own folder that does not exist.
 #
 # IT FOLLOWS ONLY THE DRIVER'S PLOTTING INCLUDE, not everything the driver includes. A
 # driver also pulls in Model.jl, Params.jl and the rest of the solver, and the solver has
@@ -741,12 +947,12 @@ def replot_driver(job: dict) -> str | None:
 # everything it reaches — plot_runs.jl, panels_shared.jl, panel_catalogue.jl, registry.jl
 # and its labels and colours — really does change what comes out.
 #
-# AND THE DECK'S OWN layout.jl, which is drawing code that lives in output/<deck>/ and is
+# AND THE DECK'S OWN layout.jl, which is drawing code that lives in modelplots/<deck>/ and is
 # the one plotter that differs per deck. It is safe to compare: panel_catalogue.jl rewrites
 # it only when the content changes, so a redraw does not touch its mtime and cannot make a
 # deck permanently accuse itself.
 
-SWEEP_PLOTTING_JL = os.path.join(REPO, "Model_3", "plotting_sweep.jl")
+SWEEP_PLOTTING_JL = os.path.join(REPO, "plotter", "plotting_sweep.jl")
 
 # The two include forms these sources use. Anything else — an include of a variable, a
 # computed path — resolves to nothing and drops out of the closure: a plotter that cannot
@@ -763,7 +969,7 @@ def _include_targets(path: str) -> list[str]:
     here = os.path.dirname(path)
     out = [os.path.normpath(os.path.join(here, m.group(1))) for m in _INC_STR.finditer(text)]
     for m in _INC_JOIN.finditer(text):
-        # joinpath(@__DIR__, "..", "Model_3", "plotting.jl") — only the @__DIR__-anchored
+        # joinpath(@__DIR__, "..", "plotter", "plotting.jl") — only the @__DIR__-anchored
         # form is resolvable from here, and it is the only one the sources use.
         toks = [here if t.group(0) == "@__DIR__" else t.group(1)
                 for t in re.finditer(r'@__DIR__|"([^"]*)"', m.group(1))]
@@ -799,7 +1005,7 @@ def plotter_files(deck: str, kind: str) -> list[str]:
     because it has to produce one command; this does not have to pick — a change in either
     model's drawing code is a reason to look at the folder again.
 
-    The fallback, for a folder no JOBS table names, is Model_3's plotting — which is what
+    The fallback, for a folder no JOBS table names, is plotter/plotting.jl — which is what
     the parsers above already treat as the authority, and is a great deal closer to the
     truth than watching nothing at all.
     """
@@ -809,7 +1015,7 @@ def plotter_files(deck: str, kind: str) -> list[str]:
         if os.path.isfile(f) and f not in found:
             found.append(f)
 
-    for job in REPLOT_JOBS.get(deck, {}).values():
+    for job in jobs_of(deck).values():
         rel = replot_driver(job)
         if rel is None:                       # M1: no replot driver, so nothing to walk
             continue
@@ -830,7 +1036,7 @@ def plotter_files(deck: str, kind: str) -> list[str]:
 # ══════════════════════════════════════════════════════════════════════════════
 # WHICH BRANCH
 # ══════════════════════════════════════════════════════════════════════════════
-# A run writes into simulations/ and output/ and then UPLOADS the deck's PNGs to Google
+# A run writes into simulations/ and modelplots/ and then UPLOADS the deck's PNGs to Google
 # Drive. Neither the store, nor the deck folder, nor the upload records which checkout
 # produced them — so a solve started from a side branch makes figures indistinguishable
 # from the ones the shared code makes, and the only trace of the difference is a working
@@ -956,8 +1162,14 @@ def build_command(model: str, deck: str, run_ids: list[str], extra: str,
     errored, because nothing was wrong with the run — only with which run it was. Named
     explicitly, the line is also the one in the notes:
 
-        _MODEL=4 _DECK=jugular_compression_m1_vs_m4 _RUN_IDS=m4,m4p \
-            _PROTOCOL=pressure _RAMP_TARGET=Pext julia --project=. main.jl
+        _DECK=jugular_compression_m1_vs_m4 _RUN_IDS=m4,m4p \
+            _PROTOCOL=pressure _RAMP_TARGET=Pext julia --project=. Model_3/main.jl
+
+    THE MODEL IS THE FOLDER. The command runs that model's own entry point, named in
+    MODEL_DIRS / SOLVE_ENTRY, from the repo root — there is no root dispatcher to send a
+    `_MODEL` to. A PATIENT deck also carries `_PATIENT`, on both paths: the recording
+    decides the protocol's timing, the fitted parameters and the store variant, and a run
+    without it is patient 081's.
 
     `amp` is `_RAMP_AMP` — HOW FAR the ramp goes, degrees or mmHg by protocol (Protocol.jl
     owns both, and the units). Empty means "do not set it", which is not the same as
@@ -1007,22 +1219,32 @@ def build_command(model: str, deck: str, run_ids: list[str], extra: str,
             env.update(_SWEEP=job.get("sweep", ""), _REPLOT="1", _SIM_MODE="1")
         elif job.get("beats_models"):
             env["_BEATS_MODELS"] = job["beats_models"]
+        if job.get("patient"):
+            env["_PATIENT"] = job["patient"]
         argv = ["julia", "--project=.", driver]
         return _finish(env, argv, extra)
-    env = {"_MODEL": model, "_DECK": deck}
+    entry = f"{MODEL_DIRS[model]}/{SOLVE_ENTRY[model]}"
+    argv = ["julia", *SOLVE_FLAGS.get(model, []), "--project=.", entry]
+    if model in SOLVE_ENV:
+        # M7's export stage takes the patient and nothing else — no deck, no ids, no
+        # protocol: it solves its four runs on that recording's own compression.
+        env = dict(SOLVE_ENV[model], _PATIENT=patient_of(deck))
+        return _finish(env, argv, extra)
+    env = {"_DECK": deck}
     if pin:
         env["_SIM_STAMP"] = pin
     if run_ids:
         env["_RUN_IDS"] = ",".join(run_ids)
+    if is_patient_deck(deck):
+        env["_PATIENT"] = patient_of(deck)
     env["_PROTOCOL"] = protocol
     env["_RAMP_TARGET"] = ramp
     if amp.strip():
         env["_RAMP_AMP"] = amp.strip()
     if not plot:
         env["_NOPLOT"] = "1"
-    # Free-form `K=V K=V`, applied last so it can override anything above — including
-    # _MODEL, which is occasionally what you want.
-    return _finish(env, ["julia", "--project=.", "main.jl"], extra)
+    # Free-form `K=V K=V`, applied last so it can override anything above.
+    return _finish(env, argv, extra)
 
 
 def _finish(env: dict[str, str], argv: list[str], extra: str):
@@ -1174,7 +1396,7 @@ def main() -> int:
             f"           ({e})\n"
             "  install it:  sudo apt install python3-tk\n"
             "  or run under an interpreter that already has it, e.g.\n"
-            "      ~/anaconda3/bin/python3 scripts/deckboard.py\n"
+            "      ~/anaconda3/bin/python3 deckboard/deckboard.py\n"
             "  --report needs no Tk and works on any interpreter.") from None
 
     sims = simulations()
@@ -1341,7 +1563,7 @@ def main() -> int:
                            font=MONO, bd=0, highlightthickness=0).pack(side="left")
         preview()
 
-    for tag in ("1", "3", "4"):
+    for tag in MODEL_DIRS:
         tk.Radiobutton(mrow, text=f" M{tag} ", value=tag, variable=model_var,
                        command=rebuild_ids, bg=PANEL, fg=ACCENT2, selectcolor=EDGE,
                        activebackground=EDGE, activeforeground=BG, font=MONO_B,
@@ -1577,6 +1799,11 @@ def main() -> int:
             elif replot_driver(job) is None:
                 notes.append(f"M{job['model']} has no replot driver — the vintage is "
                              f"pinned, but this will still SOLVE")
+        if model_var.get() in SOLVE_ENV and (chosen or not plot_var.get()) and not state["pin"]:
+            notes.append(f"M{model_var.get()} solves through "
+                         f"{SOLVE_ENTRY[model_var.get()]}, which exports all of its runs for "
+                         f"patient {patient_of(deck)} and draws nothing — untick the ids to "
+                         f"redraw {deck} afterwards")
         if plot_var.get() or state["pin"]:
             notes.append("this ends by uploading the deck's PNGs to Google Drive.")
         warn_lbl.configure(text="  ".join("⚠ " + n for n in notes))
@@ -1655,7 +1882,7 @@ def main() -> int:
         xtxt.tag_configure(tag, foreground=ACCENT2)
         state.update(sel=x, seltag=tag, del_armed=False, pin=x.stamp)
         del_btn.configure(text="✕ DELETE", bg=PANEL, fg=BAD)
-        if x.model[1:] in ("1", "3", "4") and x.model.startswith("m"):
+        if x.model.startswith("m") and x.model[1:] in MODEL_DIRS:
             model_var.set(x.model[1:])
             rebuild_ids()
         if x.meta.get("deck"):
@@ -1676,7 +1903,7 @@ def main() -> int:
         amp_entry.delete(0, "end")
         if x.meta.get("ramp_amp") is not None:
             amp_entry.insert(0, f"{float(x.meta['ramp_amp']):g}")
-        # An output/ .h5 predates the store and has no vintage to pin. It is listed so it
+        # A modelplots/ .h5 predates the store and has no vintage to pin. It is listed so it
         # can be SEEN and deleted, and the label says why it will not pin.
         pin_lbl.configure(text=(f"{x.stamp} · {x.file}" if x.stamp else
                                 f"{x.file} — no vintage to pin"),
@@ -1848,17 +2075,31 @@ def main() -> int:
             # Clearing the pin does NOT go back to solving on its own — `select` unticks
             # every id, and no ids ticked is still a draw. Ticking one is what makes it a
             # solve, and that round trip is the whole of the new rule.
-            assert current()[0][-1] != "main.jl", \
+            assert not current()[0][-1].endswith("/main.jl"), \
                 "with no ids ticked the board must draw, not solve"
             rid = sorted(id_vars)[0]
             id_vars[rid].set(True)
             argv, env, shown = current()
-            assert argv[-1] == "main.jl" and env.get("_RUN_IDS") == rid, \
+            assert argv[-1].endswith("/main.jl") and env.get("_RUN_IDS") == rid, \
                 f"ticking {rid} did not restore the solving entry point: {shown}"
             print(f"  ticked {rid}:")
             print(f"    {shown}")
             id_vars[rid].set(False)
             assert "_RUN_IDS" not in current()[1], "unticking left _RUN_IDS in the command"
+        # Every model button has somewhere to go, and a patient deck draws through M5's
+        # driver with its recording named.
+        for m in MODEL_DIRS:
+            assert os.path.isfile(os.path.join(REPO, MODEL_DIRS[m], SOLVE_ENTRY[m])), \
+                f"M{m} has no {MODEL_DIRS[m]}/{SOLVE_ENTRY[m]}"
+        pdeck = next((d for d in ds if is_patient_deck(d.name)), None)
+        if pdeck is not None:
+            argv, env, shown = build_command("5", pdeck.name, [], "", True, "",
+                                             *selection_for_deck(pdeck.name, "5"))
+            assert argv[-1].endswith("replot_deck.jl") and env.get("_PATIENT") == \
+                patient_of(pdeck.name) and env.get("_PROTOCOL") == "pressure", \
+                f"patient deck {pdeck.name} built {shown}"
+            print(f"  patient deck {pdeck.name} (p{patient_of(pdeck.name)}):")
+            print(f"    {shown}")
         print(f"  terminals available: "
               f"{[n for n, _ in TERMINALS if shutil.which(n)] or 'NONE — set $TERMINAL'}")
         root.destroy()

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Deckboard
+Comment=What has been solved, what has been drawn, and which is stale
+Exec=bash %HOME%/.local/bin/deckboard.sh
+Icon=%HOME%/.local/share/icons/brain.svg
+Terminal=false
+Categories=Science;
+Keywords=brainphysio;simulation;deck;plots;
+StartupNotify=true
+StartupWMClass=Deckboard

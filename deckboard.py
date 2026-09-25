@@ -826,7 +826,7 @@ def exports() -> list[Export]:
 # deck this cannot find gets no replot offered, instead of one drawn as the wrong protocol.
 
 PLOT_ALL_JL = {n: os.path.join(REPO, MODEL_DIRS[n], "plot_all_decks.jl")
-               for n in ("3", "4")}
+               for n in ("1", "3", "4")}
 
 
 def _kwargs(s: str) -> dict[str, str]:
@@ -840,11 +840,12 @@ def parse_replot_jobs() -> dict[str, dict[str, dict]]:
     replot_deck.jl, a sweep to main_sweep.jl with _REPLOT=1. The `deck` INSIDE a sweep
     entry is not the key — a sweep folder is drawn by the analysis deck it belongs to.
 
-    KEYED BY MODEL, because there are two tables and they overlap. `postural_changes_k_sweep`
-    is in both, each drawing it with its own analysis deck. And the model has to come from
-    the TABLE rather than from the MODEL buttons: `postural_changes_m1_vs_m3` is an M1-and-M3
-    deck that only Model_3 knows how to redraw, so choosing the driver by which model
-    produced the .h5 would send it to a Model_1 replot driver that does not exist.
+    KEYED BY MODEL, because there are several tables and M3's and M4's overlap.
+    `postural_changes_k_sweep` is in both, each drawing it with its own analysis deck. And
+    the model has to come from the TABLE rather than from the MODEL buttons:
+    `postural_changes_m1_vs_m3` is an M1-and-M3 deck that M3's table redraws, and M1's
+    driver would draw it with M1's `comps`. M1's own table holds only the decks M1 alone
+    draws.
     """
     jobs: dict[str, dict[str, dict]] = {}
     for model, path in PLOT_ALL_JL.items():
@@ -919,9 +920,9 @@ def selection_for_deck(deck: str, model: str) -> tuple[str, str]:
 
 
 def replot_driver(job: dict) -> str | None:
-    """The script that redraws without solving, if the job's model has one. M1 has no
-    replot_deck.jl, and saying so is better than pinning a vintage onto an entry point that
-    will cheerfully solve it again."""
+    """The script that redraws without solving, if the job's model has one. A model
+    without a replot_deck.jl gets None, and saying so is better than pinning a vintage onto
+    an entry point that will cheerfully solve it again."""
     rel = f"{MODEL_DIRS[job['model']]}/" + ("main_sweep.jl" if job["kind"] == "sweep"
                                             else "replot_deck.jl")
     return rel if os.path.isfile(os.path.join(REPO, rel)) else None
@@ -1017,7 +1018,7 @@ def plotter_files(deck: str, kind: str) -> list[str]:
 
     for job in jobs_of(deck).values():
         rel = replot_driver(job)
-        if rel is None:                       # M1: no replot driver, so nothing to walk
+        if rel is None:                       # no replot driver, so nothing to walk
             continue
         driver = os.path.join(REPO, rel)
         add(driver)                           # it chooses the panels, so it is a plotter

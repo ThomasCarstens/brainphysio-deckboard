@@ -1,3 +1,5 @@
+<img src="brain.svg" alt="" width="32" align="right">
+
 # Deckboard
 
 What has been solved, what has been drawn, and which is stale — for the brainphysio
@@ -84,5 +86,5 @@ sed "s|^REPO=.*|REPO=\${DECKBOARD_REPO:-$HOME/brainphysio_celia}|" \
 chmod +x ~/.local/bin/deckboard.sh
 sed "s|%HOME%|$HOME|g" deckboard/launcher/deckboard.desktop \
     > ~/.local/share/applications/deckboard.desktop
-cp brain.svg ~/.local/share/icons/brain.svg
+cp deckboard/brain.svg ~/.local/share/icons/brain.svg
 ```

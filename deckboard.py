@@ -1308,7 +1308,11 @@ MONO    = ("DejaVu Sans Mono", 10)
 MONO_B  = ("DejaVu Sans Mono", 10, "bold")
 TITLE_F = ("DejaVu Sans Mono", 15, "bold")
 
-BRAIN_SVG = os.path.join(REPO, "brain.svg")
+# This repo carries its own copy, so the banner mark does not depend on the checkout it reads;
+# the checkout's copy is the fallback for an older clone of this repo.
+BRAIN_SVG = next((p for p in (os.path.join(os.path.dirname(os.path.abspath(__file__)), "brain.svg"),
+                              os.path.join(REPO, "brain.svg")) if os.path.isfile(p)),
+                 os.path.join(REPO, "brain.svg"))
 
 
 def _quad_points(d: str) -> list[tuple[float, float]]:

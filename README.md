@@ -15,6 +15,14 @@ launched from the window itself.
 
 The header of `deckboard.py` explains every design decision at length.
 
+## The window
+
+The left half is what is on disk: every solved vintage, and every deck folder with its
+verdict. The right half builds the command that brings a deck up to date, and lists the
+exports it can replot instead of solving.
+
+![The Deckboard window with each part labelled: SIMULATIONS and PLOTS on the left, RERUN and EXPORTS on the right](docs/window.png)
+
 ## Getting it
 
 Deckboard is a git submodule of the brainphysio repo, at `deckboard/`, on the

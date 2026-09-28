@@ -43,8 +43,8 @@ deck also carries the closure of the sources that DRAW it, walked from the inclu
 the replot driver the JOBS table names for it, and the badge says REPLOT when they are the
 only thing that moved.
 
-WHICH BRANCH YOU ARE ON is asked once, above the run button, because a run ends by putting
-PNGs on Google Drive and nothing in that upload records the checkout that drew them.
+WHICH BRANCH YOU ARE ON is asked once, above the run button, because nothing a run writes —
+not the exports, not the PNGs — records the checkout that drew them.
 
 NO NEW DEPENDENCIES — tkinter, subprocess and the stdlib, plus simstore.py from the repo
 root. It is a .py rather than a notebook because it has to own a window and a subprocess for
@@ -63,8 +63,8 @@ degrees under :angle, mmHg under :pressure — because amplitude was the one thi
 protocol you had to edit Protocol.jl to change.
 
 RUNNING A SOLVE IS TWO CLICKS, NEVER ONE. Building the command and executing it are separate
-buttons, because a deck run ends by uploading its PNGs to Google Drive — a misclick is an
-outward-facing action, not just some wasted minutes.
+buttons, because a deck run draws its PNGs over the ones already in the deck folder — a
+misclick replaces pictures, not just some wasted minutes.
 
 THE RUN GOES TO A NEW TERMINAL. The board does not own the process at all: it builds the
 command, opens a terminal window and hands it over. A terminal already does scrollback,
@@ -1037,12 +1037,12 @@ def plotter_files(deck: str, kind: str) -> list[str]:
 # ══════════════════════════════════════════════════════════════════════════════
 # WHICH BRANCH
 # ══════════════════════════════════════════════════════════════════════════════
-# A run writes into simulations/ and modelplots/ and then UPLOADS the deck's PNGs to Google
-# Drive. Neither the store, nor the deck folder, nor the upload records which checkout
-# produced them — so a solve started from a side branch makes figures indistinguishable
-# from the ones the shared code makes, and the only trace of the difference is a working
-# tree you may well move off before anyone asks. The board cannot fix that. It can say it,
-# once, in the last place where saying it is still free: directly above the run button.
+# A run writes into simulations/ and modelplots/, and neither the store nor the deck folder
+# records which checkout produced them — so a solve started from a side branch makes figures
+# indistinguishable from the ones the shared code makes, and the only trace of the
+# difference is a working tree you may well move off before anyone asks. The board cannot
+# fix that. It can say it, once, in the last place where saying it is still free: directly
+# above the run button.
 
 def _git(*args: str) -> str:
     """git in the repo, or "". This window has to open with no git installed, on a copy
@@ -1089,7 +1089,7 @@ def branch_warning() -> str:
     if on_main or not branch:
         return ""
     return (f"⚠ ON {branch} — {m} is the main branch here. What this run solves and "
-            f"uploads is drawn by code that is not on {m}.")
+            f"draws comes from code that is not on {m}.")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1809,8 +1809,6 @@ def main() -> int:
                          f"{SOLVE_ENTRY[model_var.get()]}, which exports all of its runs for "
                          f"patient {patient_of(deck)} and draws nothing — untick the ids to "
                          f"redraw {deck} afterwards")
-        if plot_var.get() or state["pin"]:
-            notes.append("this ends by uploading the deck's PNGs to Google Drive.")
         warn_lbl.configure(text="  ".join("⚠ " + n for n in notes))
 
     # --- the pin, and where the last run went -------------------------------
@@ -1843,7 +1841,7 @@ def main() -> int:
 
     def spawn():
         """Two clicks, unchanged. What the second one costs is now a window rather than a
-        wait — but a deck run still ends by uploading its PNGs, so a single stray click
+        wait — but a deck run still draws over the deck's PNGs, so a single stray click
         must not be able to start one."""
         if not state["armed"]:
             state["armed"] = True
